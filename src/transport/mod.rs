@@ -1,0 +1,48 @@
+//! Abstract peer-to-peer channel — the seam for how Alice and Bob talk during the interactive
+//! OP_RAND setup (DESIGN §9, L1).
+//!
+//! The whole commit-blind-reveal exchange — TX templates, `H_k`/`T`/`X` + `π_a`, `K_b` + `π_r`,
+//! MuSig2 nonce-commitment rounds and partial signatures — is a turn-based conversation over an
+//! **ordered, reliable, framed, already-authenticated** bidirectional message channel between
+//! the two peers. Nothing above this trait cares *how* those frames travel.
+//!
+//! The intended production transport is the **BIP324 covert channel** (decoy packets carrying
+//! the round-trips; see `docs/BIP324-PATCH-NOTES.md` and [`bip324`]). But that is one choice.
+//! This trait is deliberately minimal so anyone can drop in a different medium — plain TCP, an
+//! overlay/onion route, a relay like Nostr, files exchanged out-of-band, or the in-memory
+//! [`memory::channel_pair`] used by tests — without touching the protocol logic.
+//!
+//! ## Contract for implementors
+//! - **Framing preserved.** Each [`Transport::recv`] returns exactly one frame that some
+//!   [`Transport::send`] passed — no splitting or coalescing. (Stream transports like TCP must
+//!   add their own length-delimiting; `bitcoind`'s decoy packets are already message-framed.)
+//! - **Ordered & reliable.** Frames arrive in send order, exactly once, or `recv` errors.
+//! - **Two parties.** A channel connects exactly Alice↔Bob; peer identity/auth and rendezvous
+//!   live *below* this trait (e.g. the BIP324 handshake, garbage membership signaling) and are
+//!   assumed established before a `Transport` exists.
+//! - **Payload-opaque.** Frames are bytes; the protocol layer owns (de)serialization, so no
+//!   serialization format is imposed on alternative transports.
+//!
+//! The interface is synchronous and blocking, which fits a turn-based protocol; an async
+//! variant can be added later if a transport needs it.
+
+pub mod bip324;
+pub mod memory;
+
+use crate::Result;
+
+/// An ordered, reliable, framed, authenticated bidirectional channel to the peer.
+///
+/// Object-safe: hold one as `Box<dyn Transport>` to stay agnostic to the medium.
+pub trait Transport {
+    /// Send one framed message to the peer.
+    fn send(&mut self, frame: &[u8]) -> Result<()>;
+
+    /// Block until the next framed message arrives from the peer, returning it whole.
+    fn recv(&mut self) -> Result<Vec<u8>>;
+
+    /// Flush any buffered outbound data. Default: no-op (unbuffered transports).
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}

@@ -21,13 +21,16 @@
 //! regtest (see `proofs`).
 
 pub mod keys;
+pub mod messages;
 pub mod musig;
 pub mod params;
 pub mod proofs;
 pub mod protocol;
+pub mod setup;
 pub mod regtest;
 pub mod reveal;
 pub mod thimbles;
+pub mod transport;
 pub mod txgraph;
 
 /// Which side of the table a party sits on.
@@ -58,6 +61,10 @@ pub enum Error {
     Rpc(#[from] bitcoincore_rpc::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("transport: {0}")]
+    Transport(&'static str),
+    #[error("decode: {0}")]
+    Decode(&'static str),
     #[error("proof {0} failed verification")]
     ProofInvalid(&'static str),
     #[error("protocol misuse: {0}")]

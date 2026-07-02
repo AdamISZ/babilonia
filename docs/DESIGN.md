@@ -79,47 +79,52 @@ channel update" bandwidth blowup). Neither applies to on-chain, small-`n`, one-s
 
 - **Chain cover:** funding and settlement become bare MuSig2 keypath spends — the most
   common, least distinguishable spend type. No revealed pubkey preimage, no script.
-- **Network cover / bandwidth:** the relations stop being SNARK statements (no
-  `hash160` in-circuit) and collapse to **pure discrete-log sigma protocols** —
-  a CDS-OR of Chaum–Pedersen DLEQ proofs plus a dlog proof. Sub-KB, no trusted setup,
-  fast verify. This *dissolves* the covert-channel byte-budget problem that first
-  looked like the binding constraint.
+- **Network cover / bandwidth:** the relations collapse to **pure discrete-log sigma
+  protocols**. The **[2026-07-02 hash-free redesign]** goes further than "no `hash160`
+  in-circuit": there is now **no hash in any circuit at all** — Kurbatov's `hash_p` bridge is
+  gone (see below), so the only proof is `π_r`, a CDS 1-of-2 OR of Schnorr dlog clauses, plus
+  two Schnorr PoKs on the thimbles. `π_a` degenerates to a plain adaptor check (no OR). Sub-KB,
+  sub-ms, no trusted setup. This *dissolves* the covert-channel byte-budget problem that first
+  looked like the binding constraint. (`JOIN-CONSTRUCTION.md`, `adaptor_construction_spec (1).tex`.)
 
 **[DECIDED] Fairness is geometry-independent.** The commit-blind-reveal ordering lives
 entirely off-chain over L1. Whether we settle as one joined tx or two unlinked txs
 changes nothing about whether the coin is fair — it only changes settlement/atomicity.
 This is the seam: **core ⟂ geometry.**
 
-### Notation
+### Notation  **[2026-07-02: hash-free, one thimble rank]**
 
 - Roles: **Alice = Challenger/chooser**, **Bob = Accepter/guesser**.
-- Identity keys `P_A = sk_A·G`, `P_B = sk_B·G`.
-- Alice's thimble secrets `a_1, a_2 ← F_p`; first-rank `A_k = a_k·G`.
-- `h_k = hash_p(A_k)`; third-rank commitments `H_k = h_k·G` (published, `k ∈ {1,2}`).
-- Alice's secret choice `i* ∈ {1,2}`; her reveal value is `A_{i*}` (hence `h_{i*}`).
-- Bob's secret guess `j* ∈ {1,2}`; he builds his pot claim around `H_{j*}`.
-- **Win:** Bob wins iff `j* = i*` (equivalently `h_{j*} = h_{i*}`).
-- Bob's pot-claim secret is `sk_B + h_{j*}`. He can only obtain `h_{j*}` if it is
-  revealed, which happens (as `h_{i*}`) **iff** `i* = j*`. The inequality case needs
-  *no* on-chain enforcement: a losing Bob simply cannot produce the signature.
+- Funding keys `P_A = x_a·G`, `P_B = x_b·G` (both **public** — they form `Q`). Bob also has a
+  **hidden claim key** `W_b = w_b·G` used only in `K = W_b + H_y`; it must differ from `P_B`, or
+  Alice would recover it from `Q` and learn `y`.
+- **Thimbles:** `h_1, h_2 ← F_p`; `H_i = h_i·G` (published with a Schnorr PoK of each `dlog`).
+  No `A_i` rank, no `hash_p` — `H_i` is a plain random point.
+- Alice's secret choice `c ∈ {1,2}`; Bob's secret guess `y ∈ {1,2}`. **Win:** Bob wins iff `y = c`.
+- **Reveal:** adaptor point `H_c`, adaptor secret `h_c` (surfaces on settlement).
+- Bob's pot-claim key `K = W_b + H_y`, secret `w_b + h_y`. He can compute it **iff** `h_c` is
+  revealed and `y = c`. The inequality case needs *no* on-chain enforcement: a losing Bob simply
+  cannot sign.
 
-### Proof obligations (all pure-DL sigma protocols)
+### Proof obligations (pure-DL sigma protocols — only one is an OR)
 
-- `π_a` (Alice): the `H_k` are derived correctly from committed `A_k`, and her
-  reveal/adaptor is bound to **one** committed `A_{i*}`.
-- `π_r` (Bob): his claim uses exactly one of `{H_1, H_2}` (blinds `j*`), plus knowledge
-  of `dlog(P_B)`.
-- Each "`X = t·(P_A + A_k)` with `T = t·G`" statement is a DLEQ
-  (`log_{(P_A+A_k)}(X) = log_G(T)`); the choice over `k` is a CDS-OR.
+- **`H_i` well-formedness** (Alice): two Schnorr PoKs of `dlog(H_1), dlog(H_2)`; Bob checks
+  `H_1 ≠ H_2`.
+- **`π_r` (Bob):** `R_r = { (w_b, y) : ⋁_y (K − H_y = w_b·G) }` — a CDS 1-of-2 OR of Schnorr
+  dlog-knowledge. Hides `y` and `w_b`, binds `K` to one thimble (and proves `W_b = w_b·G`
+  implicitly, no duplicated clause).
+- **`π_a` (Alice):** **no OR** — because Bob commits first (below), `c` needn't be hidden. Alice
+  names `c`; Bob does a plain adaptor-signature check `R̄ + e·Q − ŝ·G ?= H_c`.
 
-### Anti-equivocation **[OPEN — critical]**
+### Anti-equivocation / choice-hiding **[RESOLVED — via ordering]**
 
-Alice must not be able to designate a *different* `A_{i*}` after the fact (e.g. by
-holding several candidate carriers and picking which to reveal once she'd know the
-outcome). Bind the reveal to **one** committed point inside `π_a` — and, for the
-back-solve optimization (§5), bind it to a **specific outpoint**, fixed before Bob
-commits `j*`. The adaptor and the OR-proof must bind *jointly*; this is where a
-fairness break would hide.
+An adaptor point is **public** (`H_c = R̄ + e·Q − ŝ·G`), so it cannot be hidden by any ZK OR.
+Choice-hiding is therefore **temporal, not cryptographic**: **Bob commits his pick (`K`, `π_r`)
+before Alice's adaptor pre-signature `ŝ` exists.** Then Bob learning `H_c` is inert (he is locked
+to `y`), and Alice commits `c` blind to `y` (hidden `P_B` masks `K`). This replaces the old
+`t`-blinding and the "bind the reveal to one committed point" concern — Alice is bound to one
+`H_c` by adaptor soundness, and cannot equivocate because she settles blind to the outcome.
+(`JOIN-CONSTRUCTION.md` §3, §7.)
 
 ---
 
@@ -138,27 +143,27 @@ Funding TX1:  [Alice v_A, Bob v_B]  ->  Q_fund = MuSig2(P_A, P_B)   (+ change)
 Q_fund spends (all pre-arranged at setup):
   (a) RefundTx     : Q_fund -> {v_A->Alice, v_B->Bob}, nLockTime T2, keypath
                      (both pre-sign; the NO-REVEAL fallback -- NOT "Alice wins")
-  (b) ChallengeTx  : Q_fund -> Q' ; Bob pre-signs his half, Alice completes with an
-                     adaptor that LEAKS h_{i*} on broadcast   <-- THE REVEAL
+  (b) ChallengeTx  : Q_fund -> Q' ; Bob pre-signs his plain half, Alice completes with an
+                     adaptor on H_c that LEAKS h_c on broadcast   <-- THE REVEAL
 
   The pot Q' (created only by ChallengeTx) is ONE taproot UTXO with both payouts:
-    keypath : K_b = t_b·(P_B + H_{j*})              [Bob wins  -- immediate, keypath, private]
+    keypath : K = W_b + H_y                         [Bob wins  -- immediate, keypath, private]
     leaf    : <N> OP_CSV OP_DROP <P_A'> OP_CHECKSIG [Alice wins -- N blocks RELATIVE to Q']
 ```
 
-**Timeline once live.** Alice broadcasts **ChallengeTx** (publishes `h_{i*}`, creates `Q'`) →
-Bob's window is `N` blocks **relative to `Q'`**: if `i*=j*` then `h_{j*}=h_{i*}` and Bob takes
-`Q'` by keypath → else Alice takes `Q'` by the CSV leaf after `N` → else (no reveal) RefundTx
-at `T2`.
+**Timeline once live.** Alice broadcasts **ChallengeTx** (publishes `h_c`, creates `Q'`) →
+Bob's window is `N` blocks **relative to `Q'`**: if `y = c` then `h_c = h_y` and Bob takes
+`Q'` (via `K = W_b + H_y`, secret `x_b+h_y`) → else Alice takes `Q'` by the CSV leaf after `N`
+→ else (no reveal) RefundTx at `T2`.
 
 > **[DECIDED 2026-07-02, refined]** The invariant: both payouts descend from the single
 > reveal-child UTXO `Q'` (never two sibling outputs), and Alice's timeout is **relative to the
 > reveal** — an *absolute* `nLockTime T1` is unsafe (Alice compresses Bob's window by revealing
-> late). The diagram above is the **all-or-nothing reduction** (keypath = `K_b`, Alice on a CSV
+> late). The diagram above is the **all-or-nothing reduction** (keypath = `K`, Alice on a CSV
 > leaf — the lone script-path spend). **BUILD TARGET = the δ-split (§7), which is FULLY
 > KEYPATH:** with a split the winner owes the loser `d−δ`, so a free keypath sweep can't settle
 > → settlement becomes two fixed-output *pre-signed* keypath txs (the §8.2 model). Then `Q'`
-> keypath = `MuSig2(P_a,P_b)`, `K_b` demotes to the *gating adaptor point* on Bob's fallback,
+> keypath = `MuSig2(P_a,P_b)`, `K` demotes to the *gating adaptor point* on Bob's fallback,
 > and the **CSV leaf is eliminated**. So δ-splits *recover* full payment-indistinguishability
 > rather than cost it; residual = only the §8 fee tell on the unilateral fallbacks. Full spec +
 > game theory + indistinguishability accounting: `JOIN-CONSTRUCTION.md` §5a.
@@ -172,8 +177,8 @@ own timelock fallback even when Bob won. Fix:
 
 Alice's *only* path to Bob's stake is `broadcast ChallengeTx → win`. Withholding
 returns her own stake and nothing more → it is a pure **blind abort**, not a grief.
-She must decide to reveal **before** she learns `j*` (Bob's guess stays hidden behind
-`π_r` until the reveal resolves it), so the reveal is **outcome-blind** → fairness
+She must decide to reveal **before** she learns `y` (Bob's guess stays hidden behind
+`π_r`/hidden `P_B` until the reveal resolves it), so the reveal is **outcome-blind** → fairness
 holds. Kurbatov's match-gating is intact underneath (losing Bob can't sign).
 
 - **Bob-negligence** (won but doesn't claim in his `N`-block window): pot goes to Alice's
@@ -190,11 +195,12 @@ holds. Kurbatov's match-gating is intact underneath (losing Bob can't sign).
 
 ### Optimization **[OPEN]**: eliminate ChallengeTx via back-solve
 
-ChallengeTx is the extra-tx footprint cost. Back-solve `A_{i*}` so the reveal folds
-into an ordinary Alice spend she'd make anyway (carrier = a specific pre-committed
+ChallengeTx is the extra-tx footprint cost. Fold the reveal (Alice's adaptor on `H_c`) into an
+ordinary Alice spend she'd make anyway (carrier = a specific pre-committed
 outpoint). Tricky points: the commit-now / reveal-later temporal split widens the
-abort window; anti-equivocation (§4) must pin exactly one carrier; reconciling
-"reveal-on-spend" with taproot means the carrier payment's *signature* is the adaptor,
+abort window; the carrier must be pinned (and stay compatible with the §4 Bob-commits-first
+ordering); reconciling "reveal-on-spend" with taproot means the carrier payment's *signature* is
+the adaptor,
 so Bob is quietly involved in constructing Alice's "ordinary" payment.
 
 ---
@@ -210,7 +216,7 @@ privacy than the join; strictly harder to build.
   both legs, Alice the timelock fallback on both; outcome routes both coins to one party.
 - **Hard nut [OPEN]:** forcing the reveal with **no shared anchor**. The default
   winner's timelock path needs no reveal, so the armed state must be engineered so that
-  *nothing* is spendable by anyone without `h_{i*}` public. Inherits CoinSwap timelock
+  *nothing* is spendable by anyone without `h_c` public. Inherits CoinSwap timelock
   asymmetry (winner's claim window before the abort `nLockTime`).
 - **[DECIDED] Splits reduce to this:** a determined split `x:y` = a deterministic swap
   (pure CoinSwap, no randomness) + a small all-or-nothing bet on the residual. So
@@ -250,9 +256,9 @@ Resolution:
    > **[DECIDED 2026-07-02, refined] The join is fully keypath.** For the δ-split build target
    > there is **no script leaf**: because the winner owes the loser `d−δ`, settlement is two
    > fixed-output *pre-signed* keypath txs (the §8.2 model just below) — `Q'` keypath =
-   > `MuSig2(P_a,P_b)`, Bob's win gated by an adaptor on `K_b`, Alice's timeout a pre-signed
-   > `nSequence`-relative keypath spend. A script-path CSV leaf appears *only* in the
-   > all-or-nothing reduction (where `Q'` keypath = `K_b` forces Alice onto a leaf). §5,
+   > `MuSig2(P_a,P_b)`, Bob's win gated by an adaptor on `K = W_b + H_y`, Alice's timeout a
+   > pre-signed `nSequence`-relative keypath spend. A script-path CSV leaf appears *only* in the
+   > all-or-nothing reduction (where `Q'` keypath = `K` forces Alice onto a leaf). §5,
    > `JOIN-CONSTRUCTION.md` §5a.
 2. **Front-load cooperation to setup.** Exchange the adaptor sigs for *both* outcomes
    at setup (both parties cooperative by construction). The winner then completes the
@@ -320,14 +326,19 @@ binding constraint (L2 proofs are sub-KB, §4).
 
 ## 10. Open problems register
 
-1. **[L2] Anti-equivocation binding** — *resolved for the join* via `π_a` binding `X` to one
-   branch + verifying the adaptor against the committed `T` (see `JOIN-CONSTRUCTION.md` §7).
-   Back-solve/outpoint binding still open. §4, §5.
+1. **[L2] Anti-equivocation / choice-hiding** — **RESOLVED** by the hash-free redesign's
+   **Bob-commits-first ordering**: adaptor points are public and can't be hidden by a proof, so
+   the hiding is temporal, not cryptographic (`JOIN-CONSTRUCTION.md` §3). No more `X`/`T` binding
+   or back-solve concern.
 2. **[L2] MuSig2 nonce hygiene** across RefundTx / ChallengeTx / settlement spends —
    disjoint nonces or we leak keys. §5.
-3. **[L2] Adaptor wiring** — *sidestepped* by the **decoupled** construction (signing key ⟂
-   adaptor secret → standard Schnorr adaptor; `JOIN-CONSTRUCTION.md` §2, §7). Residual: a
-   written reduction that auxiliary `X` leaks nothing beyond DDH. §5.
+3. **[L2] Proofs / adaptor wiring** — **RESOLVED**: hash-free → pure sigma protocols (only `π_r`
+   an OR; `π_a` a plain adaptor check; two thimble PoKs). No `hash_p`, no `t`/`X`, no SNARK.
+   Formal security proofs being worked independently. `JOIN-CONSTRUCTION.md` §9,
+   `adaptor_construction_spec (1).tex`.
+3b. **[L2] ChallengeTx adaptor form** — must be the **s-value** adaptor (challenge over the
+   un-adapted nonce) so Bob's partial doesn't reference `H_c`; needed for the ordering, and a
+   code-integration point vs the `musig2` crate's nonce-adaptor default. §4, PROTOCOL §6.
 4. **[geometry] Swap forced-reveal without a shared anchor** + timelock-asymmetry tree.
    §6.
 5. **[privacy] Tx-sequence motif** — does a recurring funding→challenge→settle pattern

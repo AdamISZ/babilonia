@@ -164,22 +164,22 @@ mod tests {
         let tx = build_challenge(q_fund_outpoint, pot, &q_prime, Amount::from_sat(300)).unwrap();
         let sighash = key_spend_sighash(&tx, 0, &[q_fund_txout]).unwrap();
 
-        // Adaptor secret t / point T for the reveal.
-        let t = Scalar::from(Keypair::new(&secp).sk);
-        let big_t = t.base_point_mul();
+        // The reveal: adaptor secret h_c (Alice's chosen thimble scalar), adaptor point H_c.
+        let h_c = Scalar::from(Keypair::new(&secp).sk);
+        let h_c_point = h_c.base_point_mul();
 
         // Two-party adaptor signing over the tweaked Q_fund key.
         let (r1a, pna) = q_fund.keyagg.first_round(0, a.sk, seed()).unwrap();
         let (r1b, pnb) = q_fund.keyagg.first_round(1, b.sk, seed()).unwrap();
-        let (mut r2a, psa) = r1a.sign_adaptor(1, pnb, a.sk, big_t, sighash).unwrap();
-        let (mut r2b, psb) = r1b.sign_adaptor(0, pna, b.sk, big_t, sighash).unwrap();
+        let (mut r2a, psa) = r1a.sign_adaptor(1, pnb, a.sk, h_c_point, sighash).unwrap();
+        let (mut r2b, psb) = r1b.sign_adaptor(0, pna, b.sk, h_c_point, sighash).unwrap();
         r2a.receive(1, psb).unwrap();
         r2b.receive(0, psa).unwrap();
         let pre = r2a.finalize().unwrap();
 
-        // Alice completes with t; the signature must verify for the P2TR output key over the
+        // Alice completes with h_c; the signature must verify for the P2TR output key over the
         // exact sighash — i.e. bitcoind would accept this key-path spend.
-        let final_sig = adapt(&pre, &t).unwrap();
+        let final_sig = adapt(&pre, &h_c).unwrap();
         musig2::verify_single(q_fund.keyagg.agg_point(), final_sig, sighash)
             .expect("completed adaptor sig is a valid taproot key-path signature");
 
@@ -189,15 +189,14 @@ mod tests {
         agg_x.copy_from_slice(&q_fund.keyagg.agg_xonly());
         assert_eq!(agg_x, q_fund.output_key.serialize(), "musig agg == bitcoin output key");
 
-        // The reveal: Bob recovers t from the broadcast signature.
-        assert_eq!(extract(&pre, &final_sig).unwrap().unwrap(), t);
+        // The reveal: Bob recovers h_c from the broadcast signature.
+        assert_eq!(extract(&pre, &final_sig).unwrap().unwrap(), h_c);
     }
 
     // --- Settlement signing paths (offline; verify against Q''s output key over its sighash) ---
 
-    use crate::reveal::{bob_claim_secret, compute_k_b};
+    use crate::reveal::{claim_secret, compute_k};
     use bitcoin::hashes::Hash;
-    use musig2::secp::Point;
 
     fn q_prime_setup(
         a: &Keypair,
@@ -215,32 +214,32 @@ mod tests {
         (q_prime, outpoint, value, sighash, tx)
     }
 
-    /// SettleBobWins: adaptor-locked on `K_b`; only a winner (who knows `dlog(K_b)`) completes it.
+    /// SettleBobWins: adaptor-locked on `K = W_b + H_y`; only a winner (who knows
+    /// `dlog(K) = w_b + h_y`) completes it.
     #[test]
-    fn settle_bob_wins_adaptor_on_k_b() {
+    fn settle_bob_wins_adaptor_on_k() {
         let secp = secp256k1::Secp256k1::new();
         let a = Keypair::new(&secp);
-        let b = Keypair::new(&secp);
+        let b = Keypair::new(&secp); // Bob's funding key (in Q)
         let (q_prime, _, _, sighash, _) = q_prime_setup(&a, &b);
 
-        // Bob's pot key: t_b, and the revealed win scalar h (= h_{i*}). x_b is Bob's identity key.
-        let t_b = Scalar::from(Keypair::new(&secp).sk);
-        let x_b = Scalar::from(b.sk);
+        // Bob's hidden claim key W_b (distinct from the funding key b) and the revealed win
+        // scalar h_win (= h_c). K = W_b + H_win, dlog(K) = w_b + h_win.
+        let w_b = Scalar::from(Keypair::new(&secp).sk);
         let h_win = Scalar::from(Keypair::new(&secp).sk);
-        let p_b: Point = b.pk.into();
-        let k_b = compute_k_b(&t_b, &p_b, &h_win.base_point_mul()).unwrap();
-        let claim = bob_claim_secret(&t_b, &x_b, &h_win).unwrap(); // dlog(K_b)
+        let k = compute_k(&w_b.base_point_mul(), &h_win.base_point_mul()).unwrap();
+        let claim = claim_secret(&w_b, &h_win).unwrap(); // dlog(K)
 
-        // Both parties adaptor-sign SettleBobWins against K_b.
+        // Both parties adaptor-sign SettleBobWins against K.
         let (r1a, pna) = q_prime.keyagg.first_round(0, a.sk, seed()).unwrap();
         let (r1b, pnb) = q_prime.keyagg.first_round(1, b.sk, seed()).unwrap();
-        let (mut r2a, psa) = r1a.sign_adaptor(1, pnb, a.sk, k_b, sighash).unwrap();
-        let (mut r2b, psb) = r1b.sign_adaptor(0, pna, b.sk, k_b, sighash).unwrap();
+        let (mut r2a, psa) = r1a.sign_adaptor(1, pnb, a.sk, k, sighash).unwrap();
+        let (mut r2b, psb) = r1b.sign_adaptor(0, pna, b.sk, k, sighash).unwrap();
         r2a.receive(1, psb).unwrap();
         r2b.receive(0, psa).unwrap();
         let pre = r2a.finalize().unwrap();
 
-        // Bob completes with dlog(K_b) → valid key-path signature for Q'.
+        // Bob completes with dlog(K) → valid key-path signature for Q'.
         let final_sig = adapt(&pre, &claim).unwrap();
         musig2::verify_single(q_prime.keyagg.agg_point(), final_sig, sighash)
             .expect("winner's completed SettleBobWins is valid");
