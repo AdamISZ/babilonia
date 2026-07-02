@@ -29,7 +29,7 @@ pub mod protocol;
 pub mod setup;
 pub mod regtest;
 pub mod reveal;
-pub mod thimbles;
+pub mod sigma;
 pub mod transport;
 pub mod txgraph;
 

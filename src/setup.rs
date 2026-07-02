@@ -11,16 +11,26 @@
 //! is hidden and only appears blinded in `K = W_b + H_y`. If `K` reused `P_b`, Alice would
 //! recover it from `Q` and learn `y` — so they must differ.
 
-use musig2::secp::Point;
+use musig2::secp::{Point, Scalar};
 
 use crate::keys::Keypair;
 use crate::messages::{Accept, Open};
 use crate::musig::KeyAgg;
-use crate::proofs::{ProofA, ProofR, Verifier};
 use crate::reveal::compute_k;
-use crate::thimbles::Thimbles;
+use crate::sigma;
 use crate::transport::Transport;
 use crate::{Error, Result};
+
+/// Fiat–Shamir context binding `π_a` to Alice's key.
+fn ctx_a(p_a: &Point) -> Vec<u8> {
+    p_a.serialize().to_vec()
+}
+/// Fiat–Shamir context binding `π_r` to both funding keys.
+fn ctx_r(p_a: &Point, p_b: &Point) -> Vec<u8> {
+    let mut v = p_a.serialize().to_vec();
+    v.extend_from_slice(&p_b.serialize());
+    v
+}
 
 /// Game parameters Alice fixes in her opening offer (Bob adds his stake in `Accept`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,8 +45,10 @@ pub struct GameParams {
 pub struct AliceSecrets {
     /// Public identity/funding key `P_a`.
     pub identity: Keypair,
-    /// Her two thimbles and secret choice `c`.
-    pub thimbles: Thimbles,
+    /// The two thimble secret scalars `h_1, h_2` (thimbles are `H_i = h_i·G`).
+    pub thimbles: [Scalar; 2],
+    /// Alice's secret choice `c ∈ {0,1}`.
+    pub choice: usize,
 }
 
 /// Bob's private setup inputs.
@@ -65,15 +77,15 @@ pub struct SetupState {
     pub keyagg: KeyAgg,
 }
 
-/// Run Alice's side: send her thimbles, receive and verify Bob's commitment.
-pub fn run_alice<T: Transport, V: Verifier>(
+/// Run Alice's side: send her thimbles (with `π_a`), receive and verify Bob's commitment (`π_r`).
+pub fn run_alice<T: Transport>(
     ch: &mut T,
-    verifier: &V,
     params: GameParams,
     s: &AliceSecrets,
 ) -> Result<SetupState> {
     let p_a: Point = s.identity.pk.into();
-    let [h1, h2] = s.thimbles.points();
+    let [h1, h2] = s.thimbles.map(|h| h.base_point_mul());
+    let pi_a = sigma::prove_pi_a(&s.thimbles, &ctx_a(&p_a));
 
     ch.send(
         &Open {
@@ -84,13 +96,15 @@ pub fn run_alice<T: Transport, V: Verifier>(
             p_a,
             h1,
             h2,
-            pi_a: vec![], // AssumeValid
+            pi_a,
         }
         .encode(),
     )?;
 
     let accept = Accept::decode(&ch.recv()?)?;
-    verifier.verify_pi_r(&ProofR { bytes: accept.pi_r })?;
+    if !sigma::verify_pi_r(&accept.k, &[h1, h2], &ctx_r(&p_a, &accept.p_b), &accept.pi_r) {
+        return Err(Error::ProofInvalid("pi_r"));
+    }
 
     let p_b_pub: secp256k1::PublicKey = accept.p_b.into();
     let keyagg = KeyAgg::new_taproot([s.identity.pk, p_b_pub])?;
@@ -106,28 +120,28 @@ pub fn run_alice<T: Transport, V: Verifier>(
     })
 }
 
-/// Run Bob's side: receive + verify Alice's thimbles, commit his pick.
-pub fn run_bob<T: Transport, V: Verifier>(
-    ch: &mut T,
-    verifier: &V,
-    s: &BobSecrets,
-) -> Result<SetupState> {
+/// Run Bob's side: receive + verify Alice's thimbles (`π_a`), commit his pick (with `π_r`).
+pub fn run_bob<T: Transport>(ch: &mut T, s: &BobSecrets) -> Result<SetupState> {
     if s.guess >= 2 {
         return Err(Error::Protocol("guess out of range (expected 0 or 1)"));
     }
 
     let open = Open::decode(&ch.recv()?)?;
-    verifier.verify_pi_a(&ProofA { bytes: open.pi_a })?;
     if open.h1 == open.h2 {
         return Err(Error::Protocol("degenerate thimbles: H_1 == H_2"));
     }
     let h = [open.h1, open.h2];
+    if !sigma::verify_pi_a(&h, &ctx_a(&open.p_a), &open.pi_a) {
+        return Err(Error::ProofInvalid("pi_a"));
+    }
 
     let p_b: Point = s.funding.pk.into();
-    let w_b: Point = s.claim.pk.into();
-    let k = compute_k(&w_b, &h[s.guess])?; // K = W_b + H_y
+    let w_b_point: Point = s.claim.pk.into();
+    let w_b_scalar: Scalar = s.claim.sk.into();
+    let k = compute_k(&w_b_point, &h[s.guess])?; // K = W_b + H_y
+    let pi_r = sigma::prove_pi_r(&w_b_scalar, s.guess, &k, &h, &ctx_r(&open.p_a, &p_b))?;
 
-    ch.send(&Accept { bob_stake: s.stake, p_b, k, pi_r: vec![] }.encode())?;
+    ch.send(&Accept { bob_stake: s.stake, p_b, k, pi_r }.encode())?;
 
     let p_a_pub: secp256k1::PublicKey = open.p_a.into();
     let keyagg = KeyAgg::new_taproot([p_a_pub, s.funding.pk])?;
@@ -151,10 +165,8 @@ pub fn run_bob<T: Transport, V: Verifier>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proofs::AssumeValid;
     use crate::reveal::claim_secret;
     use crate::transport::memory::channel_pair;
-    use musig2::secp::Scalar;
 
     fn scalar(secp: &secp256k1::Secp256k1<secp256k1::All>) -> Scalar {
         Scalar::from(Keypair::new(secp).sk)
@@ -165,9 +177,9 @@ mod tests {
         let secp = secp256k1::Secp256k1::new();
 
         let c = 1usize;
-        let thimbles = Thimbles::new(scalar(&secp), scalar(&secp), c);
-        let h_chosen = thimbles.chosen().h_point;
-        let alice = AliceSecrets { identity: Keypair::new(&secp), thimbles };
+        let thimbles = [scalar(&secp), scalar(&secp)];
+        let h_chosen = thimbles[c].base_point_mul();
+        let alice = AliceSecrets { identity: Keypair::new(&secp), thimbles, choice: c };
         let bob = BobSecrets {
             funding: Keypair::new(&secp),
             claim: Keypair::new(&secp),
@@ -179,8 +191,8 @@ mod tests {
         let params = GameParams { alice_stake: 100_000, delta: 10_000, reveal_window: 6, refund_locktime: 200 };
 
         let (mut alice_ch, mut bob_ch) = channel_pair();
-        let bob_handle = std::thread::spawn(move || run_bob(&mut bob_ch, &AssumeValid, &bob));
-        let a_state = run_alice(&mut alice_ch, &AssumeValid, params, &alice).unwrap();
+        let bob_handle = std::thread::spawn(move || run_bob(&mut bob_ch, &bob));
+        let a_state = run_alice(&mut alice_ch, params, &alice).unwrap();
         let b_state = bob_handle.join().unwrap().unwrap();
 
         // Identical shared view.
@@ -197,7 +209,7 @@ mod tests {
         assert_eq!(b_state.k, compute_k(&w_b.base_point_mul(), &h_chosen).unwrap());
         // The claim secret w_b + h_c has K as its public key (Bob could claim on a win).
         assert_eq!(
-            claim_secret(&w_b, &thimbles.chosen().h).unwrap().base_point_mul(),
+            claim_secret(&w_b, &thimbles[c]).unwrap().base_point_mul(),
             b_state.k
         );
 

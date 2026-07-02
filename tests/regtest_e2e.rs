@@ -8,7 +8,6 @@ use babilonia::keys::Keypair;
 use babilonia::musig::{adapt, signature_bytes, svalue_presig, svalue_reveal, KeyAgg};
 use babilonia::regtest::RegtestNode;
 use babilonia::reveal::{claim_secret, compute_k, won};
-use babilonia::thimbles::Thimbles;
 use babilonia::txgraph::{build_challenge, build_settlement, key_spend_sighash, TaprootKey};
 use bitcoin::{Address, Amount, Network, OutPoint, TxOut, Witness};
 use bitcoincore_rpc::RpcApi;
@@ -219,16 +218,15 @@ fn full_game_bob_wins_capstone() {
 
     // Alice's thimbles + choice c; the chosen thimble scalar h_c IS the reveal secret.
     let c = 1usize;
-    let thimbles = Thimbles::new(
+    let thimbles = [
         Scalar::from(Keypair::new(&secp).sk),
         Scalar::from(Keypair::new(&secp).sk),
-        c,
-    );
-    let h_c = thimbles.chosen().h;
+    ];
+    let h_c = thimbles[c];
 
     // Bob guesses y = c (a win) and forms K = W_b + H_y.
     let y = c;
-    let h_guessed = thimbles.thimbles[y].h_point; // H_y = H_c
+    let h_guessed = thimbles[y].base_point_mul(); // H_y = H_c
     let w_b: Scalar = w.sk.into();
     let w_b_point: Point = w.pk.into();
     let k = compute_k(&w_b_point, &h_guessed).unwrap();
@@ -267,7 +265,7 @@ fn full_game_bob_wins_capstone() {
     // Bob confirms the win and computes his claim secret dlog(K) = w_b + h_c.
     assert!(won(&h_recovered, &h_guessed), "Bob won (y == c)");
     let other = 1 - c;
-    assert!(!won(&h_recovered, &thimbles.thimbles[other].h_point), "the other thimble loses");
+    assert!(!won(&h_recovered, &thimbles[other].base_point_mul()), "the other thimble loses");
     let claim = claim_secret(&w_b, &h_recovered).unwrap();
     assert_eq!(claim.base_point_mul(), k, "claim secret is exactly dlog(K)");
     println!("[win]    Bob confirmed the win and computed dlog(K) ✓");
