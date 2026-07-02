@@ -1,0 +1,24 @@
+[package]
+name = "babilonia"
+version = "0.0.1"
+edition = "2021"
+description = "OP_RAND-emulation lottery-as-mix: single-anchor pot, decoupled adaptor reveal, delta-split keypath settlement (L2 core)"
+publish = false
+
+[dependencies]
+# Crypto: MuSig2 (BIP327) + Schnorr adaptor signatures. `musig2` re-exports the `secp` crate
+# (Point/Scalar with inversion — the reveal's t^-1) and secp256k1 0.31 as its backend.
+musig2 = { version = "0.4", features = ["rand"] }
+# Same `secp` crate musig2 re-exports; declared directly to turn on scalar inversion
+# (`secp256k1-invert`) — the reveal's t^-1. Features unify across the shared instance.
+secp = { version = "0.7", features = ["secp256k1", "secp256k1-invert"] }
+secp256k1 = { version = "0.31", features = ["std", "rand"] }
+# Bitcoin tx construction / taproot / regtest RPC (its own secp256k1 0.29; byte boundary).
+bitcoin = { version = "0.32", features = ["rand-std", "serde"] }
+bitcoincore-rpc = "0.19"
+rand = "0.8"
+thiserror = "2"
+hex = "0.4"
+sha2 = "0.10"
+
+[dev-dependencies]
