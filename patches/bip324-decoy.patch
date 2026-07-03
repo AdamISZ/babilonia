@@ -1,0 +1,239 @@
+diff --git a/src/net.cpp b/src/net.cpp
+index 7684877ec..eaf7d3588 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -1258,6 +1258,9 @@ bool V2Transport::ProcessReceivedPacketBytes() noexcept
+                 // Any other state is invalid (this function should not have been called).
+                 Assume(false);
+             }
++        } else {
++            // Babilonia: capture the decoy payload for the covert channel instead of dropping it.
++            m_recv_decoys.emplace_back(m_recv_decode_buffer.begin(), m_recv_decode_buffer.end());
+         }
+         // Wipe the receive buffer where the next packet will be received into.
+         ClearShrink(m_recv_buffer);
+@@ -1510,6 +1513,30 @@ bool V2Transport::SetMessageToSend(CSerializedNetMsg& msg) noexcept
+     return true;
+ }
+ 
++bool V2Transport::SetDecoyToSend(Span<const uint8_t> contents) noexcept
++{
++    // Babilonia: a decoy is an ordinary v2 packet with the ignore bit set. Same send-buffer
++    // discipline as SetMessageToSend, but the payload is `contents` verbatim (no message-type
++    // encoding) and the cipher's ignore flag is set.
++    AssertLockNotHeld(m_send_mutex);
++    LOCK(m_send_mutex);
++    if (m_send_state == SendState::V1) return false; // v1 has no decoys
++    if (!(m_send_state == SendState::READY && m_send_buffer.empty())) return false;
++    m_send_buffer.resize(contents.size() + BIP324Cipher::EXPANSION);
++    m_cipher.Encrypt(MakeByteSpan(contents), {}, /*ignore=*/true, MakeWritableByteSpan(m_send_buffer));
++    m_send_type = "decoy";
++    return true;
++}
++
++std::vector<std::vector<uint8_t>> V2Transport::GetReceivedDecoys() noexcept
++{
++    AssertLockNotHeld(m_recv_mutex);
++    LOCK(m_recv_mutex);
++    std::vector<std::vector<uint8_t>> out;
++    out.swap(m_recv_decoys);
++    return out;
++}
++
+ Transport::BytesToSend V2Transport::GetBytesToSend(bool have_next_message) const noexcept
+ {
+     AssertLockNotHeld(m_send_mutex);
+@@ -1609,7 +1636,10 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
+             // there is an existing message still being sent, or (for v2 transports) when the
+             // handshake has not yet completed.
+             size_t memusage = it->GetMemoryUsage();
+-            if (node.m_transport->SetMessageToSend(*it)) {
++            // Babilonia: a decoy-flagged queue entry is emitted as a BIP324 decoy packet.
++            const bool moved = it->m_is_decoy ? node.m_transport->SetDecoyToSend(it->data)
++                                              : node.m_transport->SetMessageToSend(*it);
++            if (moved) {
+                 // Update memory usage of send buffer (as *it will be deleted).
+                 node.m_send_memusage -= memusage;
+                 ++it;
+@@ -3930,6 +3960,32 @@ bool CConnman::ForNode(NodeId id, std::function<bool(CNode* pnode)> func)
+     return found != nullptr && NodeFullyConnected(found) && func(found);
+ }
+ 
++bool CConnman::SendDecoy(NodeId id, Span<const uint8_t> payload)
++{
++    // Babilonia: queue the decoy through the normal send path (vSendMsg), flagged as a decoy so
++    // the transport emits it as a BIP324 ignore packet (see SocketSendData / V2Transport).
++    CSerializedNetMsg msg;
++    msg.m_is_decoy = true;
++    msg.data.assign(payload.begin(), payload.end());
++    bool queued = false;
++    ForNode(id, [&](CNode* node) {
++        PushMessage(node, std::move(msg));
++        queued = true;
++        return true;
++    });
++    return queued;
++}
++
++std::vector<std::vector<uint8_t>> CConnman::GetDecoys(NodeId id)
++{
++    std::vector<std::vector<uint8_t>> out;
++    ForNode(id, [&](CNode* node) {
++        out = node->m_transport->GetReceivedDecoys();
++        return true;
++    });
++    return out;
++}
++
+ CSipHasher CConnman::GetDeterministicRandomizer(uint64_t id) const
+ {
+     return CSipHasher(nSeed0, nSeed1).Write(id);
+diff --git a/src/net.h b/src/net.h
+index e025b20bc..425ead1a4 100644
+--- a/src/net.h
++++ b/src/net.h
+@@ -124,11 +124,15 @@ struct CSerializedNetMsg {
+         CSerializedNetMsg copy;
+         copy.data = data;
+         copy.m_type = m_type;
++        copy.m_is_decoy = m_is_decoy;
+         return copy;
+     }
+ 
+     std::vector<unsigned char> data;
+     std::string m_type;
++    /** Babilonia: if true, send `data` as a BIP324 v2 decoy packet (ignore bit set) rather
++     *  than a normal message. Ignored by v1 transports. */
++    bool m_is_decoy{false};
+ 
+     /** Compute total memory usage of this object (own memory + any dynamic memory). */
+     size_t GetMemoryUsage() const noexcept;
+@@ -287,6 +291,9 @@ public:
+      */
+     virtual CNetMessage GetReceivedMessage(std::chrono::microseconds time, bool& reject_message) = 0;
+ 
++    /** Babilonia: drain and return the payloads of decoy packets received so far (empty for v1). */
++    virtual std::vector<std::vector<uint8_t>> GetReceivedDecoys() noexcept = 0;
++
+     // 2. Sending side functions, for converting messages into bytes to be sent over the wire.
+ 
+     /** Set the next message to send.
+@@ -297,6 +304,11 @@ public:
+      */
+     virtual bool SetMessageToSend(CSerializedNetMsg& msg) noexcept = 0;
+ 
++    /** Babilonia: enqueue a BIP324 v2 decoy packet carrying `contents` (the peer decrypts it,
++     *  sees the ignore bit, and — with our patch — surfaces it via GetReceivedDecoys instead of
++     *  discarding). Same set-constraints as SetMessageToSend; false if unsupported (v1). */
++    virtual bool SetDecoyToSend(Span<const uint8_t> contents) noexcept = 0;
++
+     /** Return type for GetBytesToSend, consisting of:
+      *  - Span<const uint8_t> to_send: span of bytes to be sent over the wire (possibly empty).
+      *  - bool more: whether there will be more bytes to be sent after the ones in to_send are
+@@ -440,6 +452,9 @@ public:
+     CNetMessage GetReceivedMessage(std::chrono::microseconds time, bool& reject_message) override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+ 
+     bool SetMessageToSend(CSerializedNetMsg& msg) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
++    // Babilonia: v1 has no decoys.
++    bool SetDecoyToSend(Span<const uint8_t>) noexcept override { return false; }
++    std::vector<std::vector<uint8_t>> GetReceivedDecoys() noexcept override { return {}; }
+     BytesToSend GetBytesToSend(bool have_next_message) const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+     void MarkBytesSent(size_t bytes_sent) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+     size_t GetSendMemoryUsage() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+@@ -592,6 +607,8 @@ private:
+     std::vector<uint8_t> m_recv_aad GUARDED_BY(m_recv_mutex);
+     /** Buffer to put decrypted contents in, for converting to CNetMessage. */
+     std::vector<uint8_t> m_recv_decode_buffer GUARDED_BY(m_recv_mutex);
++    /** Babilonia: payloads of received decoy packets, awaiting retrieval via GetReceivedDecoys(). */
++    std::vector<std::vector<uint8_t>> m_recv_decoys GUARDED_BY(m_recv_mutex);
+     /** Current receiver state. */
+     RecvState m_recv_state GUARDED_BY(m_recv_mutex);
+ 
+@@ -647,9 +664,11 @@ public:
+     bool ReceivedMessageComplete() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+     bool ReceivedBytes(Span<const uint8_t>& msg_bytes) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
+     CNetMessage GetReceivedMessage(std::chrono::microseconds time, bool& reject_message) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
++    std::vector<std::vector<uint8_t>> GetReceivedDecoys() noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+ 
+     // Send side functions.
+     bool SetMessageToSend(CSerializedNetMsg& msg) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
++    bool SetDecoyToSend(Span<const uint8_t> contents) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+     BytesToSend GetBytesToSend(bool have_next_message) const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+     void MarkBytesSent(size_t bytes_sent) noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+     size_t GetSendMemoryUsage() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_send_mutex);
+@@ -1145,6 +1164,12 @@ public:
+ 
+     bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func);
+ 
++    /** Babilonia: queue a BIP324 v2 decoy packet carrying `payload` to peer `id`. False if no
++     *  such peer. */
++    bool SendDecoy(NodeId id, Span<const uint8_t> payload) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
++    /** Babilonia: drain the decoy payloads received from peer `id`. */
++    std::vector<std::vector<uint8_t>> GetDecoys(NodeId id);
++
+     void PushMessage(CNode* pnode, CSerializedNetMsg&& msg) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
+ 
+     using NodeFn = std::function<void(CNode*)>;
+diff --git a/src/rpc/net.cpp b/src/rpc/net.cpp
+index 9942386c7..0e5fc3cee 100644
+--- a/src/rpc/net.cpp
++++ b/src/rpc/net.cpp
+@@ -1179,9 +1179,58 @@ static RPCHelpMan getrawaddrman()
+     };
+ }
+ 
++static RPCHelpMan senddecoy()
++{
++    return RPCHelpMan{"senddecoy",
++        "\nBabilonia: send a BIP324 v2 decoy packet carrying arbitrary bytes to a connected peer.\n"
++        "The peer decrypts it, sees the ignore bit, and (with the Babilonia patch) surfaces the\n"
++        "payload via getdecoys instead of discarding it. Requires a v2 (BIP324) connection.\n",
++        {
++            {"nodeid", RPCArg::Type::NUM, RPCArg::Optional::NO, "The peer's node id (from getpeerinfo)."},
++            {"payload", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Hex-encoded decoy payload."},
++        },
++        RPCResult{RPCResult::Type::BOOL, "", "whether the decoy was queued for sending"},
++        RPCExamples{HelpExampleCli("senddecoy", "0 \"deadbeef\"") + HelpExampleRpc("senddecoy", "0, \"deadbeef\"")},
++    [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    NodeContext& node = EnsureAnyNodeContext(request.context);
++    CConnman& connman = EnsureConnman(node);
++    const NodeId id{request.params[0].getInt<int64_t>()};
++    const std::vector<unsigned char> payload{ParseHex(request.params[1].get_str())};
++    if (!connman.SendDecoy(id, payload)) {
++        throw JSONRPCError(RPC_MISC_ERROR, "Peer not found or not fully connected");
++    }
++    return true;
++},
++    };
++}
++
++static RPCHelpMan getdecoys()
++{
++    return RPCHelpMan{"getdecoys",
++        "\nBabilonia: drain and return the payloads of BIP324 decoy packets received from a peer.\n",
++        {
++            {"nodeid", RPCArg::Type::NUM, RPCArg::Optional::NO, "The peer's node id (from getpeerinfo)."},
++        },
++        RPCResult{RPCResult::Type::ARR, "", "", {{RPCResult::Type::STR_HEX, "", "a received decoy payload (hex)"}}},
++        RPCExamples{HelpExampleCli("getdecoys", "0") + HelpExampleRpc("getdecoys", "0")},
++    [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
++{
++    NodeContext& node = EnsureAnyNodeContext(request.context);
++    CConnman& connman = EnsureConnman(node);
++    const NodeId id{request.params[0].getInt<int64_t>()};
++    UniValue arr(UniValue::VARR);
++    for (const auto& d : connman.GetDecoys(id)) arr.push_back(HexStr(d));
++    return arr;
++},
++    };
++}
++
+ void RegisterNetRPCCommands(CRPCTable& t)
+ {
+     static const CRPCCommand commands[]{
++        {"network", &senddecoy},
++        {"network", &getdecoys},
+         {"network", &getconnectioncount},
+         {"network", &ping},
+         {"network", &getpeerinfo},

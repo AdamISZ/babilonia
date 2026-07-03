@@ -18,9 +18,12 @@ use crate::{Error, Result};
 static INSTANCE: AtomicU32 = AtomicU32::new(0);
 
 /// A self-managed regtest `bitcoind` with a loaded wallet. Killed and cleaned up on drop.
+/// P2P listening and BIP324 v2 transport are enabled, so two nodes can peer over v2.
 pub struct RegtestNode {
     child: Child,
     datadir: PathBuf,
+    /// P2P listen port (for peering two nodes).
+    p2p_port: u16,
     /// Wallet-scoped RPC client (also serves non-wallet calls).
     pub client: Client,
 }
@@ -32,22 +35,29 @@ fn free_port() -> Result<u16> {
 }
 
 impl RegtestNode {
-    /// Spawn `bitcoind -regtest`, wait for RPC, create + load a wallet, and mine to maturity so
-    /// the wallet has spendable coins.
+    /// Spawn `bitcoind -regtest` (the binary named by `$BABILONIA_BITCOIND`, else `bitcoind`),
+    /// wait for RPC, create + load a wallet, and mine to maturity.
     pub fn start() -> Result<Self> {
+        let bin = std::env::var("BABILONIA_BITCOIND").unwrap_or_else(|_| "bitcoind".into());
+        Self::start_with_binary(&bin)
+    }
+
+    /// Like [`start`](Self::start) but with an explicit `bitcoind` path (e.g. a patched build).
+    pub fn start_with_binary(bitcoind: &str) -> Result<Self> {
         let n = INSTANCE.fetch_add(1, Ordering::SeqCst);
         let datadir = std::env::temp_dir().join(format!("babilonia-regtest-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&datadir)?;
 
         let rpc_port = free_port()?;
         let p2p_port = free_port()?;
-        let child = Command::new("bitcoind")
+        let child = Command::new(bitcoind)
             .arg("-regtest")
             .arg(format!("-datadir={}", datadir.display()))
             .arg(format!("-rpcport={}", rpc_port))
             .arg(format!("-port={}", p2p_port))
             .arg("-server=1")
-            .arg("-listen=0")
+            .arg("-listen=1")
+            .arg("-v2transport=1") // BIP324
             .arg("-txindex=1")
             .arg("-fallbackfee=0.0002")
             .stdout(Stdio::null())
@@ -76,9 +86,88 @@ impl RegtestNode {
         node.create_wallet("bab", None, None, None, None)?;
         let client = Client::new(&format!("{url}/wallet/bab"), Auth::CookieFile(cookie))?;
 
-        let node = RegtestNode { child, datadir, client };
+        let node = RegtestNode { child, datadir, p2p_port, client };
         node.fund_wallet()?;
         Ok(node)
+    }
+
+    /// This node's P2P address (`127.0.0.1:<port>`).
+    pub fn p2p_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.p2p_port)
+    }
+
+    /// Add `other` as a persistent peer; Core establishes (and re-establishes) the connection.
+    pub fn connect_to(&self, other: &RegtestNode) -> Result<()> {
+        let _: serde_json::Value = self
+            .client
+            .call("addnode", &[other.p2p_addr().into(), "add".into()])?;
+        Ok(())
+    }
+
+    /// Raw `getpeerinfo` peer array.
+    pub fn peers(&self) -> Result<Vec<serde_json::Value>> {
+        let v: serde_json::Value = self.client.call("getpeerinfo", &[])?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Count of peers currently on a BIP324 **v2** transport.
+    pub fn v2_peer_count(&self) -> Result<usize> {
+        Ok(self
+            .peers()?
+            .iter()
+            .filter(|p| {
+                p.get("transport_protocol_type").and_then(|t| t.as_str()) == Some("v2")
+            })
+            .count())
+    }
+
+    /// The node id of the single connected peer (regtest two-node setups have exactly one).
+    pub fn only_peer_id(&self) -> Result<i64> {
+        let ids: Vec<i64> = self
+            .peers()?
+            .iter()
+            .filter_map(|p| p.get("id").and_then(|v| v.as_i64()))
+            .collect();
+        match ids.as_slice() {
+            [id] => Ok(*id),
+            _ => Err(Error::Protocol("expected exactly one peer")),
+        }
+    }
+
+    /// Send a BIP324 decoy packet carrying `payload` to peer `peer_id` (patched-node RPC).
+    pub fn send_decoy(&self, peer_id: i64, payload: &[u8]) -> Result<bool> {
+        let r: serde_json::Value = self
+            .client
+            .call("senddecoy", &[peer_id.into(), hex::encode(payload).into()])?;
+        Ok(r.as_bool().unwrap_or(false))
+    }
+
+    /// Drain the decoy payloads received from peer `peer_id` (patched-node RPC).
+    pub fn get_decoys(&self, peer_id: i64) -> Result<Vec<Vec<u8>>> {
+        let r: serde_json::Value = self.client.call("getdecoys", &[peer_id.into()])?;
+        let mut out = Vec::new();
+        if let Some(arr) = r.as_array() {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    out.push(hex::decode(s).map_err(|_| Error::Protocol("bad decoy hex"))?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Poll until at least `min` peers are connected over v2, or time out.
+    pub fn wait_for_v2_peers(&self, min: usize, timeout: Duration) -> Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.v2_peer_count()? >= min {
+                return Ok(true);
+            }
+            if Instant::now() > deadline {
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(200));
+        }
     }
 
     /// Mine 101 blocks to a wallet address so the first coinbase matures (spendable balance).
