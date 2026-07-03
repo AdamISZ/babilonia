@@ -24,6 +24,9 @@ pub struct RegtestNode {
     datadir: PathBuf,
     /// P2P listen port (for peering two nodes).
     p2p_port: u16,
+    /// Base RPC URL and cookie path (to mint fresh clients via `new_rpc_client`).
+    rpc_url: String,
+    cookie: PathBuf,
     /// Wallet-scoped RPC client (also serves non-wallet calls).
     pub client: Client,
 }
@@ -84,11 +87,17 @@ impl RegtestNode {
         };
 
         node.create_wallet("bab", None, None, None, None)?;
-        let client = Client::new(&format!("{url}/wallet/bab"), Auth::CookieFile(cookie))?;
+        let client = Client::new(&format!("{url}/wallet/bab"), Auth::CookieFile(cookie.clone()))?;
 
-        let node = RegtestNode { child, datadir, p2p_port, client };
+        let node = RegtestNode { child, datadir, p2p_port, rpc_url: url, cookie, client };
         node.fund_wallet()?;
         Ok(node)
+    }
+
+    /// Build a fresh (non-wallet) RPC client to this node — e.g. to hand to a `Bip324Transport`,
+    /// which owns its client. The decoy RPCs are non-wallet, so no wallet scope is needed.
+    pub fn new_rpc_client(&self) -> Result<Client> {
+        Ok(Client::new(&self.rpc_url, Auth::CookieFile(self.cookie.clone()))?)
     }
 
     /// This node's P2P address (`127.0.0.1:<port>`).

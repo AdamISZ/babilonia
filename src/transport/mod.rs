@@ -26,6 +26,7 @@
 //! The interface is synchronous and blocking, which fits a turn-based protocol; an async
 //! variant can be added later if a transport needs it.
 
+#[cfg(feature = "node")]
 pub mod bip324;
 pub mod memory;
 

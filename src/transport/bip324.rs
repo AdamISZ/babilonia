@@ -1,46 +1,98 @@
-//! BIP324 covert transport — the intended production [`Transport`] (DESIGN §9). **Not yet
-//! implemented**; this marks the seam so it can be filled without disturbing anything above.
+//! BIP324 covert transport — the intended production [`Transport`] (DESIGN §9), riding **decoy
+//! packets** on an established BIP324 v2 session between two `bitcoind` peers.
 //!
-//! Plan (see `docs/BIP324-PATCH-NOTES.md`):
-//! - The sustained interactive channel rides **decoy packets** on an established BIP324 v2
-//!   session between two `bitcoind` peers — AEAD-encrypted, so a passive observer can't tell a
-//!   decoy from a real message (only size/count/timing show). Each decoy is already
-//!   message-framed, satisfying the [`Transport`] framing contract directly.
-//! - Rendezvous / membership signaling (garbage surface) and the v2 handshake sit **below**
-//!   this type; a `Bip324Transport` is constructed only after the peer session is authenticated.
-//! - The orchestrator drives Core over a **local control API** (RPC + an async inbound path;
-//!   patch-notes §5/§6) to emit decoys (send) and route received ones (recv). That control
-//!   plane never touches the wire, so it has no bearing on detectability.
+//! A frame `send` becomes one `senddecoy` RPC → an AEAD-encrypted decoy packet on the wire; the
+//! peer's patched Core captures it and surfaces it via `getdecoys`, which `recv` drains. To a
+//! passive observer a decoy is indistinguishable from a real message (only size/count/timing
+//! leak); the RPC control plane never touches the wire.
 //!
-//! When built, `connect` will take the peer/session handle and control endpoint; `send`/`recv`
-//! will marshal frames to/from decoy packets.
+//! The framing contract holds directly: each decoy carries exactly one frame, delivered in order
+//! over the reliable v2 connection. Rendezvous, the v2 handshake, and peer auth sit **below** this
+//! type — a `Bip324Transport` is constructed only once the two nodes are peered over v2 and their
+//! node ids are known. Requires the `node` feature (drives Core over RPC).
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use bitcoincore_rpc::{Client, RpcApi};
 
 use super::Transport;
 use crate::{Error, Result};
 
-/// Placeholder for the BIP324 covert transport. Fields (Core control handle, session id, framing
-/// state) are TBD; see module docs.
+/// A [`Transport`] that tunnels frames as BIP324 decoy packets to one peer, driven over a local
+/// (patched) `bitcoind`'s `senddecoy`/`getdecoys` RPCs.
 pub struct Bip324Transport {
-    _private: (),
+    /// RPC handle to the local node whose peer we're talking to.
+    client: Client,
+    /// The counterparty's node id on this node (from `getpeerinfo`).
+    peer_id: i64,
+    /// Received frames buffered from `getdecoys` (which drains in batches) but not yet `recv`'d.
+    inbox: VecDeque<Vec<u8>>,
+    /// How often `recv` polls `getdecoys` while waiting.
+    poll_interval: Duration,
+    /// How long `recv` waits for a frame before erroring.
+    recv_timeout: Duration,
 }
 
 impl Bip324Transport {
-    /// Establish the covert channel over an existing BIP324 session. Unimplemented — returns a
-    /// [`Error::Todo`] so callers degrade gracefully rather than panic.
-    pub fn connect() -> Result<Self> {
-        Err(Error::Todo(
-            "BIP324 transport: wire to Core decoy send/recv via the local control API \
-             (see docs/BIP324-PATCH-NOTES.md)",
-        ))
+    /// Construct a transport to `peer_id` over `client`'s node. The BIP324 v2 session must already
+    /// be established (both nodes peered, `-v2transport=1`).
+    pub fn new(client: Client, peer_id: i64) -> Self {
+        Self {
+            client,
+            peer_id,
+            inbox: VecDeque::new(),
+            poll_interval: Duration::from_millis(50),
+            recv_timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Override how long `recv` blocks waiting for a frame (default 30s).
+    pub fn with_recv_timeout(mut self, timeout: Duration) -> Self {
+        self.recv_timeout = timeout;
+        self
+    }
+
+    /// Pull any decoys received from the peer into the inbox.
+    fn drain_decoys(&mut self) -> Result<()> {
+        let r: serde_json::Value = self.client.call("getdecoys", &[self.peer_id.into()])?;
+        if let Some(arr) = r.as_array() {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    let bytes = hex::decode(s).map_err(|_| Error::Transport("bad decoy hex"))?;
+                    self.inbox.push_back(bytes);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 impl Transport for Bip324Transport {
-    fn send(&mut self, _frame: &[u8]) -> Result<()> {
-        Err(Error::Todo("BIP324 transport: marshal frame into a decoy packet"))
+    fn send(&mut self, frame: &[u8]) -> Result<()> {
+        let queued: serde_json::Value = self
+            .client
+            .call("senddecoy", &[self.peer_id.into(), hex::encode(frame).into()])?;
+        if queued.as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(Error::Transport("senddecoy: peer not connected"))
+        }
     }
 
     fn recv(&mut self) -> Result<Vec<u8>> {
-        Err(Error::Todo("BIP324 transport: route decoy packet into a frame"))
+        let deadline = Instant::now() + self.recv_timeout;
+        loop {
+            if let Some(frame) = self.inbox.pop_front() {
+                return Ok(frame);
+            }
+            self.drain_decoys()?;
+            if self.inbox.is_empty() {
+                if Instant::now() > deadline {
+                    return Err(Error::Transport("recv timed out waiting for decoy"));
+                }
+                std::thread::sleep(self.poll_interval);
+            }
+        }
     }
 }

@@ -1,11 +1,20 @@
-//! BIP324 covert-transport work (DESIGN §9, L1). Stage 1: stand up two regtest nodes and get
-//! them talking over the **v2 (BIP324)** transport. Uses the stock `bitcoind` (v2 is native);
-//! the decoy-packet patch + RPC come later.
+#![cfg(feature = "node")] // drives a local bitcoind over RPC; needs the `node` feature
+//! BIP324 covert-transport work (DESIGN §9, L1). Bottom-up:
+//!   - `two_nodes_connect_over_v2`  — v2 peering (stock `bitcoind` on PATH; v2 is native)
+//!   - `decoy_round_trip_over_v2`   — raw senddecoy/getdecoys RPCs (patched node)
+//!   - `transport_round_trip_over_decoys` — the `Bip324Transport` framing (patched node)
+//!   - `setup_handshake_over_bip324` — CAPSTONE: run_alice/run_bob over the covert channel
 //!
-//! Requires `bitcoind` (v31) on PATH. Ignored by default. Run:
-//!   cargo test --test bip324 -- --ignored --nocapture
+//! Patched-node tests use `$BABILONIA_BITCOIND` (see scripts/build-patched-node.sh). Ignored by
+//! default. Run **serially** — each test spawns two mining nodes, so parallel runs contend:
+//!   cargo test --test bip324 -- --ignored --test-threads=1 --nocapture
 
+use babilonia::keys::Keypair;
 use babilonia::regtest::RegtestNode;
+use babilonia::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams};
+use babilonia::transport::{bip324::Bip324Transport, Transport};
+use musig2::secp::Scalar;
+use secp256k1::Secp256k1;
 use std::time::{Duration, Instant};
 
 /// Path to the patched Bitcoin Core build (with the senddecoy/getdecoys RPCs). Honors
@@ -95,4 +104,72 @@ fn decoy_round_trip_over_v2() {
     // Draining is exhaustive: a second read returns nothing.
     assert!(b.get_decoys(a_id_on_b).unwrap().is_empty(), "decoys drained on read");
     println!("[ok]   decoys exchanged over BIP324 v2, each side reads the other's payload ✓");
+}
+
+/// Peer two patched nodes and hand each side a `Bip324Transport`.
+fn peered_transports() -> (RegtestNode, RegtestNode, Bip324Transport, Bip324Transport) {
+    let bin = patched_bitcoind();
+    let a = RegtestNode::start_with_binary(&bin).expect("patched node A");
+    let b = RegtestNode::start_with_binary(&bin).expect("patched node B");
+    b.connect_to(&a).expect("addnode");
+    assert!(b.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "B↔A on v2");
+    assert!(a.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "A sees v2 peer");
+    let ta = Bip324Transport::new(a.new_rpc_client().unwrap(), a.only_peer_id().unwrap());
+    let tb = Bip324Transport::new(b.new_rpc_client().unwrap(), b.only_peer_id().unwrap());
+    (a, b, ta, tb)
+}
+
+/// The `Transport` trait works over real BIP324 decoys: ordered, framed, both directions.
+#[test]
+#[ignore = "requires the patched bitcoind build; run with --ignored"]
+fn transport_round_trip_over_decoys() {
+    let (_a, _b, mut ta, mut tb) = peered_transports();
+
+    ta.send(b"flight-1: alice->bob").unwrap();
+    assert_eq!(tb.recv().unwrap(), b"flight-1: alice->bob");
+    tb.send(b"flight-2: bob->alice").unwrap();
+    assert_eq!(ta.recv().unwrap(), b"flight-2: bob->alice");
+
+    // Two frames back-to-back preserve order (getdecoys drains in batches; recv buffers).
+    ta.send(b"one").unwrap();
+    ta.send(b"two").unwrap();
+    assert_eq!(tb.recv().unwrap(), b"one");
+    assert_eq!(tb.recv().unwrap(), b"two");
+    println!("[ok]   Transport frames ride BIP324 decoys, ordered, both ways ✓");
+}
+
+/// Capstone — L1 meets L2: the actual OP_RAND setup handshake (`run_alice`/`run_bob`, with real
+/// π_a/π_r sigma proofs) runs to completion over the covert decoy channel between two nodes.
+#[test]
+#[ignore = "requires the patched bitcoind build; run with --ignored"]
+fn setup_handshake_over_bip324() {
+    let (_a, _b, mut ta, mut tb) = peered_transports();
+
+    let secp = Secp256k1::new();
+    let scalar = |s: &Secp256k1<secp256k1::All>| Scalar::from(Keypair::new(s).sk);
+    let c = 1usize;
+    let alice = AliceSecrets {
+        identity: Keypair::new(&secp),
+        thimbles: [scalar(&secp), scalar(&secp)],
+        choice: c,
+    };
+    let bob = BobSecrets {
+        funding: Keypair::new(&secp),
+        claim: Keypair::new(&secp),
+        guess: c, // a winning guess
+        stake: 100_000,
+    };
+    let params = GameParams { alice_stake: 100_000, delta: 10_000, reveal_window: 6, refund_locktime: 200 };
+
+    // Bob runs on another thread; both sides talk only through their Bip324Transport.
+    let bob_handle = std::thread::spawn(move || run_bob(&mut tb, &bob));
+    let a_state = run_alice(&mut ta, params, &alice).expect("alice setup over decoys");
+    let b_state = bob_handle.join().unwrap().expect("bob setup over decoys");
+
+    // Both sides reached the same shared view — the whole commit/verify exchange survived the
+    // covert transport (π_a verified by Bob, π_r verified by Alice).
+    assert_eq!(a_state.keyagg.agg_xonly(), b_state.keyagg.agg_xonly());
+    assert_eq!(a_state.k, b_state.k);
+    assert_eq!(a_state.h, b_state.h);
+    println!("[ok]   full OP_RAND setup handshake completed over BIP324 decoys ✓");
 }

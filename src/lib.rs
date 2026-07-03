@@ -27,6 +27,8 @@ pub mod params;
 pub mod proofs;
 pub mod protocol;
 pub mod setup;
+/// Regtest harness driving a local `bitcoind` over RPC (requires the `node` feature).
+#[cfg(feature = "node")]
 pub mod regtest;
 pub mod reveal;
 pub mod sigma;
@@ -57,6 +59,7 @@ pub enum Error {
     Secp(#[from] secp256k1::Error),
     #[error("musig2: {0}")]
     Musig(String),
+    #[cfg(feature = "node")]
     #[error("bitcoin rpc: {0}")]
     Rpc(#[from] bitcoincore_rpc::Error),
     #[error("io: {0}")]

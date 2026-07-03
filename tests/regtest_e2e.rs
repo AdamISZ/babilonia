@@ -1,3 +1,4 @@
+#![cfg(feature = "node")] // drives a local bitcoind over RPC; needs the `node` feature
 //! End-to-end regtest tests (hash-free design). Fund `Q_fund`, reveal via ChallengeTx's adaptor
 //! (secret = the chosen thimble scalar `h_c`), settle `Q'`, all validated by a real `bitcoind`.
 //!

@@ -17,6 +17,20 @@ The core `babilonia` library never depends on the patched node — the setup/set
 over `&mut dyn Transport`. A builder implements `Transport` over whatever medium they ship to end
 users; those users compile no Bitcoin Core.
 
+This is enforced by the **`node` Cargo feature** (on by default), which gates the only RPC-driving
+code: the `regtest` harness and the `Bip324Transport`. A builder depends on the transport-agnostic
+core with no RPC dependencies via:
+
+```toml
+babilonia = { version = "…", default-features = false }
+```
+
+`cargo build --no-default-features` compiles the core with `bitcoincore-rpc`/`serde_json` absent from
+the dependency tree entirely; the power-user path is the default (`node` enabled). The BIP324
+transport itself — `Bip324Transport::new(rpc_client, peer_id)` — is just a thin `Transport` over the
+`senddecoy`/`getdecoys` RPCs, so it's the reference implementation of the covert tier, not a special
+case in the protocol.
+
 ### Run the patched node as a *dedicated comms node* (no funds)
 
 Don't point Babilonia at the node holding your coins. Run the patched `bitcoind` as a throwaway
