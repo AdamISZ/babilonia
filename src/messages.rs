@@ -1,49 +1,70 @@
-//! Typed wire messages for the commit-blind setup (hash-free, Bob-commits-first), plus a compact
-//! self-describing codec. These are the frames over a [`crate::transport::Transport`]
-//! (PROTOCOL.md §2–§3). Only public data — group points and opaque proof bytes.
+//! Typed wire messages for the **v5** setup flow (`adaptor_construction_spec_v5.tex`, P1–P6), plus
+//! a compact self-describing codec. These are the frames over a [`crate::transport::Transport`].
+//! Only public data — group points/scalars, MuSig2 nonces/partials, and opaque proof bytes.
 //!
-//! This module covers the **commit** flights (`Open`, `Accept`). The pre-signing/funding flight
-//! (`Arm` + partials + input sigs, PROTOCOL.md §3.3) is a later addition.
+//! Four flights (game parameters are agreed out-of-band as [`crate::setup::GameParams`]). Nonces
+//! follow key exchange, since a MuSig2 session needs both keys to form the aggregate:
+//! ```text
+//! 1. AliceOpen   A→B : P_a, thimbles A_1,A_2 (+ PoKs)                                        (P2)
+//! 2. BobCommit   B→A : P_b, K=P_b+A_y (+ π_r), refund & settlement nonces                    (P3)
+//! 3. AliceReveal A→B : refund & settlement nonces, ctxt=a_c+H(d), D=d·G, π_a (Σ-part),
+//!                      refund & settlement partials                                          (P4)
+//! 4. BobAuth     B→A : refund & settlement partials (authorises the D-adaptor pre-sig)       (P5)
+//! ```
 //!
-//! Encoding: points 33-byte compressed SEC1, integers little-endian, variable bytes `u32`-LE
+//! Encoding: points 33B SEC1, scalars/partials 32B, MuSig2 pub-nonces 66B, variable bytes `u32`-LE
 //! length-prefixed, each message a 1-byte tag; a bounds-checked reader rejects short/trailing.
 
-use musig2::secp::Point;
+use musig2::secp::{MaybeScalar, Point, Scalar};
+use musig2::{BinaryEncoding, PartialSignature, PubNonce};
 
 use crate::{Error, Result};
 
-const TAG_OPEN: u8 = 1;
-const TAG_ACCEPT: u8 = 2;
+const TAG_ALICE_OPEN: u8 = 1;
+const TAG_BOB_COMMIT: u8 = 2;
+const TAG_ALICE_REVEAL: u8 = 3;
+const TAG_BOB_AUTH: u8 = 4;
 
-/// Flight 1 — Alice → Bob. Alice's opening: game parameters + her thimbles. `pi_a` carries the
-/// Schnorr PoKs that `H_1,H_2` are well-formed (opaque for now; AssumeValid).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Open {
-    pub alice_stake: u64,
-    pub delta: u64,
-    pub reveal_window: u16,
-    pub refund_locktime: u32,
-    /// `P_a` (Alice's public identity/funding key).
+/// Flight 1 (P2) — Alice → Bob. Her funding key `P_a` and thimbles `A_1,A_2 = a_1·G, a_2·G` with
+/// PoKs.
+#[derive(Clone, Debug)]
+pub struct AliceOpen {
     pub p_a: Point,
-    /// Thimbles `H_1, H_2 = h_1·G, h_2·G`.
-    pub h1: Point,
-    pub h2: Point,
-    /// Well-formedness proofs for `H_1,H_2` (opaque).
-    pub pi_a: Vec<u8>,
+    pub a1: Point,
+    pub a2: Point,
+    pub thimble_poks: Vec<u8>,
 }
 
-/// Flight 2 — Bob → Alice. Bob's commitment: his **public funding key** `P_b` (so Alice can form
-/// `Q = MuSig2(P_a,P_b)`) and his **claim key** `K = W_b + H_y` (hides `y` and the hidden claim
-/// key `W_b`). `pi_r` proves `K` is well-formed for exactly one thimble.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Accept {
-    pub bob_stake: u64,
-    /// `P_b` — Bob's public funding key (enters `Q`; distinct from the hidden claim key `W_b`).
+/// Flight 2 (P3) — Bob → Alice. His funding key `P_b` (so Alice can form `Q`), claim key
+/// `K = P_b + A_y` (+ `π_r`), and his public nonces for the refund and settlement MuSig2 sessions.
+#[derive(Clone, Debug)]
+pub struct BobCommit {
     pub p_b: Point,
-    /// `K = W_b + H_y` — Bob's pot-claim key.
     pub k: Point,
-    /// `π_r` (opaque): CDS 1-of-2 OR that `K − H_y = w_b·G` for one `y`.
     pub pi_r: Vec<u8>,
+    pub refund_nonce: PubNonce,
+    pub settle_nonce: PubNonce,
+}
+
+/// Flight 3 (P4) — Alice → Bob. Her session nonces, the encrypted outcome `ctxt = a_c + H(d)`, the
+/// settlement adaptor point `D = d·G`, `π_a` (Σ-part; the hash conjunct is stubbed), and her
+/// partials for the settlement (adaptor on `D`) and the refund.
+#[derive(Clone, Debug)]
+pub struct AliceReveal {
+    pub refund_nonce: PubNonce,
+    pub settle_nonce: PubNonce,
+    pub ctxt: Scalar,
+    pub d_point: Point,
+    pub pi_a: Vec<u8>,
+    pub refund_partial: PartialSignature,
+    pub settle_partial: PartialSignature,
+}
+
+/// Flight 4 (P5) — Bob → Alice. His refund and settlement partials, completing both sessions.
+#[derive(Clone, Debug)]
+pub struct BobAuth {
+    pub refund_partial: PartialSignature,
+    pub settle_partial: PartialSignature,
 }
 
 // --- codec ---
@@ -51,7 +72,15 @@ pub struct Accept {
 fn put_point(out: &mut Vec<u8>, p: &Point) {
     out.extend_from_slice(&p.serialize());
 }
-
+fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
+    out.extend_from_slice(&s.serialize());
+}
+fn put_partial(out: &mut Vec<u8>, s: &PartialSignature) {
+    out.extend_from_slice(&s.serialize());
+}
+fn put_nonce(out: &mut Vec<u8>, n: &PubNonce) {
+    out.extend_from_slice(&n.to_bytes());
+}
 fn put_lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
@@ -84,17 +113,17 @@ impl<'a> Reader<'a> {
     fn point(&mut self) -> Result<Point> {
         Point::from_slice(self.take(33)?).map_err(|_| Error::Decode("invalid point"))
     }
-    fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    fn scalar(&mut self) -> Result<Scalar> {
+        Scalar::from_slice(self.take(32)?).map_err(|_| Error::Decode("invalid scalar"))
     }
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    fn partial(&mut self) -> Result<PartialSignature> {
+        MaybeScalar::from_slice(self.take(32)?).map_err(|_| Error::Decode("invalid partial"))
     }
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    fn nonce(&mut self) -> Result<PubNonce> {
+        PubNonce::from_bytes(self.take(66)?).map_err(|_| Error::Decode("invalid pubnonce"))
     }
     fn lp(&mut self) -> Result<Vec<u8>> {
-        let n = self.u32()? as usize;
+        let n = u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize;
         Ok(self.take(n)?.to_vec())
     }
     fn finish(self) -> Result<()> {
@@ -106,55 +135,94 @@ impl<'a> Reader<'a> {
     }
 }
 
-impl Open {
+impl AliceOpen {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![TAG_OPEN];
-        out.extend_from_slice(&self.alice_stake.to_le_bytes());
-        out.extend_from_slice(&self.delta.to_le_bytes());
-        out.extend_from_slice(&self.reveal_window.to_le_bytes());
-        out.extend_from_slice(&self.refund_locktime.to_le_bytes());
-        for p in [&self.p_a, &self.h1, &self.h2] {
+        let mut out = vec![TAG_ALICE_OPEN];
+        for p in [&self.p_a, &self.a1, &self.a2] {
             put_point(&mut out, p);
         }
-        put_lp(&mut out, &self.pi_a);
+        put_lp(&mut out, &self.thimble_poks);
         out
     }
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf);
-        r.tag(TAG_OPEN)?;
-        let m = Open {
-            alice_stake: r.u64()?,
-            delta: r.u64()?,
-            reveal_window: r.u16()?,
-            refund_locktime: r.u32()?,
+        r.tag(TAG_ALICE_OPEN)?;
+        let m = AliceOpen {
             p_a: r.point()?,
-            h1: r.point()?,
-            h2: r.point()?,
-            pi_a: r.lp()?,
+            a1: r.point()?,
+            a2: r.point()?,
+            thimble_poks: r.lp()?,
         };
         r.finish()?;
         Ok(m)
     }
 }
 
-impl Accept {
+impl BobCommit {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![TAG_ACCEPT];
-        out.extend_from_slice(&self.bob_stake.to_le_bytes());
+        let mut out = vec![TAG_BOB_COMMIT];
         put_point(&mut out, &self.p_b);
         put_point(&mut out, &self.k);
         put_lp(&mut out, &self.pi_r);
+        put_nonce(&mut out, &self.refund_nonce);
+        put_nonce(&mut out, &self.settle_nonce);
         out
     }
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf);
-        r.tag(TAG_ACCEPT)?;
-        let m = Accept {
-            bob_stake: r.u64()?,
+        r.tag(TAG_BOB_COMMIT)?;
+        let m = BobCommit {
             p_b: r.point()?,
             k: r.point()?,
             pi_r: r.lp()?,
+            refund_nonce: r.nonce()?,
+            settle_nonce: r.nonce()?,
         };
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl AliceReveal {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TAG_ALICE_REVEAL];
+        put_nonce(&mut out, &self.refund_nonce);
+        put_nonce(&mut out, &self.settle_nonce);
+        put_scalar(&mut out, &self.ctxt);
+        put_point(&mut out, &self.d_point);
+        put_lp(&mut out, &self.pi_a);
+        put_partial(&mut out, &self.refund_partial);
+        put_partial(&mut out, &self.settle_partial);
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_ALICE_REVEAL)?;
+        let m = AliceReveal {
+            refund_nonce: r.nonce()?,
+            settle_nonce: r.nonce()?,
+            ctxt: r.scalar()?,
+            d_point: r.point()?,
+            pi_a: r.lp()?,
+            refund_partial: r.partial()?,
+            settle_partial: r.partial()?,
+        };
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl BobAuth {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TAG_BOB_AUTH];
+        put_partial(&mut out, &self.refund_partial);
+        put_partial(&mut out, &self.settle_partial);
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_BOB_AUTH)?;
+        let m = BobAuth { refund_partial: r.partial()?, settle_partial: r.partial()? };
         r.finish()?;
         Ok(m)
     }
@@ -164,37 +232,69 @@ impl Accept {
 mod tests {
     use super::*;
     use crate::keys::Keypair;
+    use crate::musig::KeyAgg;
 
     fn some_point() -> Point {
         let secp = secp256k1::Secp256k1::new();
         Keypair::new(&secp).pk.into()
     }
+    fn some_nonce() -> PubNonce {
+        let secp = secp256k1::Secp256k1::new();
+        let a = Keypair::new(&secp);
+        let b = Keypair::new(&secp);
+        let keyagg = KeyAgg::new([a.pk, b.pk]).unwrap();
+        let (_r, n) = keyagg.first_round(0, a.sk, [7u8; 32]).unwrap();
+        n
+    }
+    fn some_scalar() -> Scalar {
+        let secp = secp256k1::Secp256k1::new();
+        Scalar::from(Keypair::new(&secp).sk)
+    }
 
     #[test]
-    fn messages_round_trip() {
-        let open = Open {
-            alice_stake: 100_000,
-            delta: 10_000,
-            reveal_window: 6,
-            refund_locktime: 200,
-            p_a: some_point(),
-            h1: some_point(),
-            h2: some_point(),
-            pi_a: vec![1, 2, 3],
-        };
-        assert_eq!(Open::decode(&open.encode()).unwrap(), open);
+    fn flights_round_trip() {
+        let open = AliceOpen { p_a: some_point(), a1: some_point(), a2: some_point(), thimble_poks: vec![1, 2, 3] };
+        assert_eq!(AliceOpen::decode(&open.encode()).unwrap().thimble_poks, open.thimble_poks);
+        assert_eq!(AliceOpen::decode(&open.encode()).unwrap().a1, open.a1);
 
-        let accept = Accept { bob_stake: 100_000, p_b: some_point(), k: some_point(), pi_r: vec![] };
-        assert_eq!(Accept::decode(&accept.encode()).unwrap(), accept);
+        let commit = BobCommit {
+            p_b: some_point(),
+            k: some_point(),
+            pi_r: vec![9],
+            refund_nonce: some_nonce(),
+            settle_nonce: some_nonce(),
+        };
+        assert_eq!(BobCommit::decode(&commit.encode()).unwrap().k, commit.k);
+
+        let reveal = AliceReveal {
+            refund_nonce: some_nonce(),
+            settle_nonce: some_nonce(),
+            ctxt: some_scalar(),
+            d_point: some_point(),
+            pi_a: vec![4, 5],
+            refund_partial: MaybeScalar::from(some_scalar()),
+            settle_partial: MaybeScalar::from(some_scalar()),
+        };
+        let dec = AliceReveal::decode(&reveal.encode()).unwrap();
+        assert_eq!(dec.ctxt, reveal.ctxt);
+        assert_eq!(dec.settle_partial, reveal.settle_partial);
+
+        let auth = BobAuth {
+            refund_partial: MaybeScalar::from(some_scalar()),
+            settle_partial: MaybeScalar::from(some_scalar()),
+        };
+        assert_eq!(BobAuth::decode(&auth.encode()).unwrap().settle_partial, auth.settle_partial);
     }
 
     #[test]
     fn decode_rejects_wrong_tag_and_junk() {
-        let accept = Accept { bob_stake: 1, p_b: some_point(), k: some_point(), pi_r: vec![] };
-        assert!(Open::decode(&accept.encode()).is_err());
-        let mut bad = accept.encode();
+        let auth = BobAuth {
+            refund_partial: MaybeScalar::from(some_scalar()),
+            settle_partial: MaybeScalar::from(some_scalar()),
+        };
+        assert!(AliceOpen::decode(&auth.encode()).is_err());
+        let mut bad = auth.encode();
         bad.push(0xff);
-        assert!(Accept::decode(&bad).is_err());
-        assert!(Accept::decode(&accept.encode()[..10]).is_err());
+        assert!(BobAuth::decode(&bad).is_err());
     }
 }

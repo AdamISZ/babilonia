@@ -5,13 +5,13 @@
 //! parties only (`P_a` = index 0, `P_b` = index 1).
 //!
 //! **Nonce hygiene is load-bearing** (DESIGN §10 open #2): every tx is a *distinct* session
-//! (RefundTx, ChallengeTx, each `Q'` settlement) and MUST use an independent `nonce_seed`, or
-//! the shared key leaks. The two-round exchange is BIP327's commitment discipline.
+//! (RefundTx, SettleTx) and MUST use an independent `nonce_seed`, or the shared key leaks. The
+//! two-round exchange is BIP327's commitment discipline.
 //!
-//! Adaptor flow (JOIN-CONSTRUCTION §4/§5a): both parties `sign_adaptor` against a point `T`
-//! (or `K_b`); the aggregate is an [`AdaptorSignature`] that is *not yet* a valid BIP340 sig.
-//! Whoever knows `dlog(T)` calls [`adapt`] to finish it — and publishing the finished sig lets
-//! the counterparty [`extract`] that secret back out. That is the reveal.
+//! Adaptor flow (v5 §P5/P6): both parties `sign_adaptor` against the settlement adaptor point
+//! `D = d·G`; the aggregate is an [`AdaptorSignature`] that is *not yet* a valid BIP340 sig. Alice
+//! (who knows `d`) calls [`adapt`] to finish it — and publishing the finished sig lets Bob
+//! [`extract`] `d` back out. That `d` decrypts the outcome (`a_c = ctxt − H(d)`); that is the reveal.
 
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use musig2::{
@@ -172,29 +172,6 @@ pub fn signature_bytes(final_sig: &LiftedSignature) -> [u8; 64] {
     final_sig.compact().serialize()
 }
 
-// --- s-value (late-bindable) adaptor — for ChallengeTx (JOIN-CONSTRUCTION §4) ---
-//
-// The nonce-adaptor above (`adapt`/`extract`) folds the adaptor point `T` into the *nonce*, so
-// its challenge `e = H(R̄+T, …)` contains `T` and every signer must know `T` to sign. The
-// s-value form folds `T` into the *s-value* instead (`e = H(R̄, …)`, independent of `T`), so a
-// co-signer's partial for the plain aggregate `full` never references `T` and can be made
-// *before* `T` is chosen. That is what lets Bob sign his ChallengeTx partial blind to `H_c`.
-
-/// From a completed **plain** aggregate signature `full = (R, s)` and adaptor secret `t`, the
-/// s-value pre-signature's scalar is `s − t` (nonce `R` unchanged). The counterparty stores this
-/// scalar; completion re-adds `t` (which just yields `full` back).
-pub fn svalue_presig(full: &LiftedSignature, secret: &Scalar) -> MaybeScalar {
-    let (_r, s): (Point, MaybeScalar) = full.unzip();
-    s.unwrap() + (-*secret)
-}
-
-/// Recover the adaptor secret `t = s_full − s_pre` from the broadcast signature and the
-/// pre-signature scalar (inverse of [`svalue_presig`]). This is Bob's reveal.
-pub fn svalue_reveal(pre_s: MaybeScalar, full: &LiftedSignature) -> MaybeScalar {
-    let (_r, s): (Point, MaybeScalar) = full.unzip();
-    s.unwrap() + (-pre_s.unwrap())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,38 +226,5 @@ mod tests {
         // And the counterparty recovers t from the broadcast signature — the reveal.
         let recovered = extract(&adaptor_sig, &final_sig).expect("extract secret");
         assert_eq!(recovered, MaybeScalar::from(t), "recovered adaptor secret == t");
-    }
-
-    /// s-value adaptor: the co-signer signs **plain** (no adaptor point), Alice picks the secret
-    /// `t` *afterwards* (late binding), and the counterparty still recovers `t` from the broadcast
-    /// signature. This is the ChallengeTx reveal with Bob blind to `H_c`.
-    #[test]
-    fn svalue_adaptor_late_binding() {
-        use crate::keys::Keypair;
-        let secp = secp256k1::Secp256k1::new();
-        let a = Keypair::new(&secp);
-        let b = Keypair::new(&secp);
-        let keyagg = KeyAgg::new([a.pk, b.pk]).unwrap();
-        let msg = [0x11u8; 32];
-
-        // Both sign PLAIN — neither passes an adaptor point. Only Alice aggregates the full sig
-        // (Bob just contributes his partial, exactly as in flight 2).
-        let (r1a, pna) = keyagg.first_round(0, a.sk, seed()).unwrap();
-        let (r1b, pnb) = keyagg.first_round(1, b.sk, seed()).unwrap();
-        let (mut r2a, _psa) = r1a.sign(1, pnb, a.sk, msg).unwrap();
-        let (_r2b, psb) = r1b.sign(0, pna, b.sk, msg).unwrap();
-        r2a.receive(1, psb).unwrap();
-        let full = r2a.finalize_plain().unwrap();
-
-        // `full` is already a valid BIP340 signature for the aggregate key.
-        let agg: Point = keyagg.ctx.aggregated_pubkey();
-        musig2::verify_single(agg, full, msg).expect("valid BIP340 sig");
-
-        // ONLY NOW does Alice choose the adaptor secret t (late binding) and form the pre-sig.
-        let t = Scalar::from(Keypair::new(&secp).sk);
-        let pre_s = svalue_presig(&full, &t); // Alice → Bob
-
-        // Bob recovers t from the pre-sig scalar and the broadcast `full`.
-        assert_eq!(svalue_reveal(pre_s, &full), MaybeScalar::from(t), "s-value reveal recovers t");
     }
 }

@@ -1,24 +1,27 @@
 //! Babilonia — L2 core for the OP_RAND-emulation "lottery-as-mix".
 //!
-//! Geometry: **join** (single funding tx). Settlement follows the δ-split, fully-keypath
-//! model of `JOIN-CONSTRUCTION.md` §5a:
+//! Geometry: **join** (adaptor spec **v5**, `docs/adaptor_construction_spec_v5.tex`). One
+//! jointly-funded output; the settlement's *own* adaptor witness `d` is the released decryption
+//! key (v4 used a second output for this; v5 folds it into the settlement, and an even earlier
+//! single-adaptor design had no atomic-and-hiding message order — see v5 §1):
 //!
 //! ```text
-//! TX1 ─► Q_fund = MuSig2(P_a,P_b) ─┬─ RefundTx   (nLockTime T2)          [no-reveal fallback]
-//!                                  └─ ChallengeTx (Alice adaptor, leaks t) ─► Q'
-//! Q' = MuSig2(P_a,P_b) keypath, spent by exactly one of:
-//!   (1) cooperative close   — fresh MuSig2 split, both sign live         [normal, fully clean]
-//!   (2) SettleBobWins       — pre-signed, Alice partial adaptor-locked on K_b (Bob completes
-//!                             iff he won), fixed split {d_B+δ, d_A−δ}
-//!   (3) SettleAliceWins     — pre-signed by both, nSequence=N from Q', fixed split {d_A+δ, d_B−δ}
+//! TX1 ─► U1 (pot, MuSig2(P_a,P_b)) ─┬─ RefundTx  (spends U1; nLockTime t_r)   [fallback]
+//!                                   └─ SettleTx  (spends U1; adaptor on D=d·G → POSTS d)
+//!        ─► ClaimOutput = P2TR(NUMS): leaf <K> CHECKSIG (Bob-wins) | <t_1> CSV <P_a> (Alice)
 //! ```
 //!
-//! Roles: **Alice = Challenger/chooser**, **Bob = Accepter/guesser**. Bob wins iff `j* = i*`.
+//! **Interlock:** Alice cannot spend `U1` (get the pot) without completing the settlement adaptor,
+//! which posts the fresh, outcome-independent dealer secret `d`. Bob then decrypts
+//! `a_c = ctxt − H(d)` (`ctxt = a_c + H(d)`, RO hash — a linear pad would leak `c`), and if he won
+//! (`a_c·G = A_y`) claims `K = W_b + A_y` with `w_b + a_c` (`W_b` = Bob's hidden claim key, ≠ his
+//! funding key). Roles: **Alice = chooser** (`c`), **Bob = guesser** (`y`); Bob wins iff `y = c`.
 //!
-//! Status: scaffold. Crypto (MuSig2/adaptor), tx construction, and the sigma proofs are
-//! typed interfaces with stubbed bodies; the setup/settlement state machine and the reveal
-//! algebra are the spine to fill in. Proofs are assume-valid until the plumbing is proven on
-//! regtest (see `proofs`).
+//! Status: **v5 rework in progress.** Done + regtest-validated: the tx graph (`txgraph`), the
+//! encrypted-outcome reveal (`reveal`), and the `π_a` **Σ-part** / `π_r` / thimble PoKs (`sigma`).
+//! Pending: the `π_a` **hash circuit** (`sigma::prove_recovery_circuit`, backend TBD) and the v5
+//! **message flow** (`setup`/`messages` still run the pre-v5 handshake). L1 BIP324 covert transport
+//! is wired (`transport::bip324`, `node` feature). The `proofs` module's `AssumeValid` is vestigial.
 
 pub mod keys;
 pub mod messages;

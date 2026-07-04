@@ -1,5 +1,16 @@
 # Join Construction — Hash-Free Adaptor Reveal, δ-split Settlement (L2 core)
 
+> **⚠ SUPERSEDED BY v5 (2026-07-04).** The single-adaptor reveal described below does **not**
+> achieve atomic settlement (see `adaptor_construction_spec_v5.tex` §1). The real construction: one
+> output `U1` (pot), whose settlement is a MuSig2 **adaptor locked to `D = d·G`** (completing it
+> posts the fresh dealer secret `d`); `RefundTx` at `t_r`; the winner `K = W_b + A_y` claims via a
+> taproot `<K>` leaf, Alice reclaims via a `t_1` timeout leaf. The outcome is a hash-padded
+> ciphertext `ctxt = a_c + H(d)` (thimbles `A_i = a_i·G`); Bob extracts `d`, gets `a_c = ctxt − H(d)`.
+> `π_a` = Σ-part (built) + one hash circuit (TBD). **Implemented + regtest-validated to v5:**
+> `src/txgraph.rs`, `src/reveal.rs`, `src/sigma.rs`. This document's construction details are pre-v5
+> and scheduled for rewrite with the message layer.
+
+
 > Status: worked cryptographic core for the **join** geometry (DESIGN.md §5, **[FOCUS]**).
 >
 > **[DECIDED 2026-07-02, hash-free redesign]** The reveal is carried entirely by a MuSig2
@@ -8,7 +19,7 @@
 > one rank `H_i = h_i·G`, and — with a **Bob-commits-first ordering** — makes both proofs pure
 > **secp256k1 sigma protocols** (no SNARK, no trusted setup, no in-circuit hash). There is no
 > longer any `t`/`X` blinding scalar or `t_b`: choice-hiding is **temporal** (ordering), not
-> cryptographic. Formal note: `adaptor_construction_spec (1).tex`.
+> cryptographic. Formal note: `adaptor_construction_spec_v5.tex`.
 >
 > The settlement layout (single reveal-child pot `Q'`, δ-split, fully keypath) from the earlier
 > design is unchanged and specified in §5a; the game theory (grief/refund) is unchanged (§7–§8).

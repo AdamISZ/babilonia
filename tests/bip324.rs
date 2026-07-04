@@ -138,8 +138,9 @@ fn transport_round_trip_over_decoys() {
     println!("[ok]   Transport frames ride BIP324 decoys, ordered, both ways ✓");
 }
 
-/// Capstone — L1 meets L2: the actual OP_RAND setup handshake (`run_alice`/`run_bob`, with real
-/// π_a/π_r sigma proofs) runs to completion over the covert decoy channel between two nodes.
+/// Capstone — L1 meets L2: the full **v5** setup driver (`run_alice`/`run_bob`, 4 flights, real
+/// thimble PoKs + π_r + π_a Σ-part; hash conjunct stubbed) runs to completion over the covert decoy
+/// channel between two nodes, pre-signing the settlement + refund.
 #[test]
 #[ignore = "requires the patched bitcoind build; run with --ignored"]
 fn setup_handshake_over_bip324() {
@@ -152,24 +153,37 @@ fn setup_handshake_over_bip324() {
         identity: Keypair::new(&secp),
         thimbles: [scalar(&secp), scalar(&secp)],
         choice: c,
+        d: scalar(&secp),
     };
     let bob = BobSecrets {
         funding: Keypair::new(&secp),
         claim: Keypair::new(&secp),
         guess: c, // a winning guess
-        stake: 100_000,
     };
-    let params = GameParams { alice_stake: 100_000, delta: 10_000, reveal_window: 6, refund_locktime: 200 };
+    let params = GameParams {
+        u1_outpoint: bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+            vout: 0,
+        },
+        u1_value: bitcoin::Amount::from_sat(500_000),
+        alice_stake: bitcoin::Amount::from_sat(250_000),
+        bob_stake: bitcoin::Amount::from_sat(248_000),
+        fee: bitcoin::Amount::from_sat(2_000),
+        refund_locktime: 200,
+        alice_timeout: 6,
+    };
 
     // Bob runs on another thread; both sides talk only through their Bip324Transport.
-    let bob_handle = std::thread::spawn(move || run_bob(&mut tb, &bob));
-    let a_state = run_alice(&mut ta, params, &alice).expect("alice setup over decoys");
-    let b_state = bob_handle.join().unwrap().expect("bob setup over decoys");
+    let params_b = params.clone();
+    let bob_handle = std::thread::spawn(move || run_bob(&mut tb, &params_b, &bob));
+    let a = run_alice(&mut ta, &params, &alice).expect("alice setup over decoys");
+    let b = bob_handle.join().unwrap().expect("bob setup over decoys");
 
-    // Both sides reached the same shared view — the whole commit/verify exchange survived the
-    // covert transport (π_a verified by Bob, π_r verified by Alice).
-    assert_eq!(a_state.keyagg.agg_xonly(), b_state.keyagg.agg_xonly());
-    assert_eq!(a_state.k, b_state.k);
-    assert_eq!(a_state.h, b_state.h);
-    println!("[ok]   full OP_RAND setup handshake completed over BIP324 decoys ✓");
+    // Both sides reached the same shared view — the whole 4-flight exchange survived the covert
+    // transport (thimble PoKs + π_r + π_a Σ-part verified, both MuSig2 sessions co-signed).
+    assert_eq!(a.keyagg.agg_xonly(), b.keyagg.agg_xonly());
+    assert_eq!(a.k, b.k);
+    assert_eq!(a.settle_sighash, b.settle_sighash);
+    assert_eq!(a.ctxt, b.ctxt);
+    println!("[ok]   full v5 OP_RAND setup driver completed over BIP324 decoys ✓");
 }

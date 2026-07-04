@@ -1,5 +1,19 @@
 # Babilonia — Design Skeleton
 
+> **⚠ v5 REWORK (2026-07-04) — read first.** The adaptor construction described in the body below
+> (a single s-value adaptor made safe by "Bob-commits-first" ordering) is **superseded**: no
+> ordering of two messages is both atomic and hiding. The real protocol is
+> `adaptor_construction_spec_v5.tex`: **one** jointly-funded output `U1` whose settlement is a
+> MuSig2 **adaptor locked to `D = d·G`** for a fresh, outcome-independent dealer secret `d`. Alice
+> can't be paid without completing it (which posts `d`); Bob then decrypts `a_c = ctxt − H(d)`
+> (`ctxt = a_c + H(d)`, RO pad — a linear pad leaks `c`) and, if he won (`a_c·G = A_y`), claims
+> `K = W_b + A_y`. `π_a` = a **Σ-part** (a committed `a_c` is one published thimble — built) + **one
+> hash circuit** (binds `ctxt` to `a_c`; Bulletproofs vs cut-and-choose TBD). Thimbles are now
+> `A_i = a_i·G` (freeing `H` for the hash). **Built + regtest-validated:** `txgraph` (single-output
+> graph), `reveal` (the `d`→`a_c` reveal), `sigma` (`π_a` Σ-part / `π_r` / thimble PoKs).
+> **Pending:** the hash circuit and the v5 message flow. Treat single-adaptor / two-output passages
+> below (and `H_i`/`h_c` notation) as stale until the rewrite lands.
+
 > Status: early architecture. This is a living spine to mark up, not a spec.
 > Tags used below: **[DECIDED]** settled direction · **[FOCUS]** current build target ·
 > **[OPEN]** unresolved · **[OUT]** explicitly out of scope.
@@ -85,7 +99,7 @@ channel update" bandwidth blowup). Neither applies to on-chain, small-`n`, one-s
   gone (see below), so the only proof is `π_r`, a CDS 1-of-2 OR of Schnorr dlog clauses, plus
   two Schnorr PoKs on the thimbles. `π_a` degenerates to a plain adaptor check (no OR). Sub-KB,
   sub-ms, no trusted setup. This *dissolves* the covert-channel byte-budget problem that first
-  looked like the binding constraint. (`JOIN-CONSTRUCTION.md`, `adaptor_construction_spec (1).tex`.)
+  looked like the binding constraint. (`JOIN-CONSTRUCTION.md`, `adaptor_construction_spec_v5.tex`.)
 
 **[DECIDED] Fairness is geometry-independent.** The commit-blind-reveal ordering lives
 entirely off-chain over L1. Whether we settle as one joined tx or two unlinked txs
@@ -298,15 +312,20 @@ Verified against Bitcoin Core HEAD; line-level detail and exact patch sites live
   > decoys. Decoys are the safe channel; garbage is the one with a (mild) distribution
   > constraint.
 
-**Patch surface** — entirely in `net.{h,cpp}` + a small local IPC/RPC module; nothing in
-consensus/validation/wallet. Garbage inject (send) / detect (recv); decoy emit (send) /
-route (recv); plus a local control API. Patch-notes §6.
+**Patch surface** — entirely in `net.{h,cpp}` + RPC commands in `rpc/net.cpp`; nothing in
+consensus/validation/wallet. Two halves: **decoy emit/route + control API** and **garbage
+inject/detect**. Patch-notes §6.
 
-**Control interface [DECIDED: RPC is fine].** The orchestrator↔Core control plane is local
-and never touches the wire, so it has **zero** bearing on detectability. Use RPC for v1
-(reuses Core's auth/tooling); pair it with an async inbound path (ZMQ-style notification or
-long-poll) since OP_RAND is interactive. A bespoke socket is a later ergonomic refinement,
-not a security need.
+> **Built [2026-07-03]:** the decoy half — `senddecoy`/`getdecoys` RPCs + decoy send/capture in
+> `V2Transport` — on Bitcoin Core **v29.3**, working two-node on regtest
+> (`patches/bip324-decoy.patch`, `scripts/build-patched-node.sh`, `docs/DEPLOYMENT.md`,
+> `tests/bip324.rs`). Garbage inject/detect (membership signaling) is **not yet built**.
+
+**Control interface [DONE: RPC].** The orchestrator↔Core control plane is local and never
+touches the wire, so it has **zero** bearing on detectability. Built as two RPCs
+(`senddecoy`/`getdecoys`) reusing Core's auth/tooling; `transport::bip324` currently **polls**
+`getdecoys` on `recv`. An async inbound path (ZMQ-style notification / long-poll) or a bespoke
+socket are later ergonomic refinements, not security needs.
 
 **v1 scoping.** For direct two-party, garbage membership-auth is *optional*: Alice
 `addnode`s Bob (optionally over Tor), peer identity is implicit, and the covert-frame key
@@ -326,19 +345,21 @@ binding constraint (L2 proofs are sub-KB, §4).
 
 ## 10. Open problems register
 
-1. **[L2] Anti-equivocation / choice-hiding** — **RESOLVED** by the hash-free redesign's
-   **Bob-commits-first ordering**: adaptor points are public and can't be hidden by a proof, so
-   the hiding is temporal, not cryptographic (`JOIN-CONSTRUCTION.md` §3). No more `X`/`T` binding
-   or back-solve concern.
-2. **[L2] MuSig2 nonce hygiene** across RefundTx / ChallengeTx / settlement spends —
-   disjoint nonces or we leak keys. §5.
-3. **[L2] Proofs / adaptor wiring** — **RESOLVED**: hash-free → pure sigma protocols (only `π_r`
-   an OR; `π_a` a plain adaptor check; two thimble PoKs). No `hash_p`, no `t`/`X`, no SNARK.
-   Formal security proofs being worked independently. `JOIN-CONSTRUCTION.md` §9,
-   `adaptor_construction_spec (1).tex`.
-3b. **[L2] ChallengeTx adaptor form** — must be the **s-value** adaptor (challenge over the
-   un-adapted nonce) so Bob's partial doesn't reference `H_c`; needed for the ordering, and a
-   code-integration point vs the `musig2` crate's nonce-adaptor default. §4, PROTOCOL §6.
+1. **[L2] Choice-hiding / atomic settlement** — the old "Bob-commits-first ordering" **did NOT**
+   achieve atomicity. **RESOLVED by the v5 interlock**: the settlement is a MuSig2 adaptor on
+   `D = d·G` for a fresh, outcome-independent `d` — Alice can't get paid without posting it (a
+   single output; v4's second output is unnecessary). `adaptor_construction_spec_v5.tex`.
+2. **[L2] MuSig2 nonce hygiene** across RefundTx / SettleTx / claim spends — disjoint nonces or we
+   leak keys. §5.
+3. **[L2] Proofs / adaptor wiring** — **v5 in progress.** `π_r` (CDS OR) + thimble PoKs + the `π_a`
+   **Σ-part** (committed `a_c` is one published thimble, + PoK of `d`) are built (`sigma`, regtest);
+   the `π_a` **hash circuit** (`ctxt = a_c + H(d)` with `d·G=D`, non-affine so not sigma —
+   Bulletproofs vs cut-and-choose) is the **one open hard piece** (`sigma::prove_recovery_circuit`,
+   TODO). Formal security proofs worked independently. `adaptor_construction_spec_v5.tex`.
+3b. **[L2] Encrypted-outcome pad** — `ctxt = a_c + H(d)` with a **random-oracle** hash pad (a linear
+   pad leaks `c`; a squaring/DDH variant was rejected as harder to prove). Recovery: Bob extracts
+   `d` from the on-chain settlement (standard adaptor `extract`), then `a_c = ctxt − H(d)`. §4,
+   PROTOCOL §P4/P6.
 4. **[geometry] Swap forced-reveal without a shared anchor** + timelock-asymmetry tree.
    §6.
 5. **[privacy] Tx-sequence motif** — does a recurring funding→challenge→settle pattern

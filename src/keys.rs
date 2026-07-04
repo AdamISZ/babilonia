@@ -1,6 +1,6 @@
 //! Party keys. Each side holds a long-term identity key and, per-session, the ephemerals the
-//! construction needs. Blinding scalars (`t` for Alice, `t_b` for Bob) live with the pieces
-//! that use them (`reveal`, `thimbles`).
+//! construction needs (Alice's thimble scalars `h_1,h_2` in `setup`; Bob's funding key `P_b` and
+//! hidden claim key `W_b`). The hash-free design has no blinding scalars — `t`/`t_b` are gone.
 
 use rand::RngCore;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};

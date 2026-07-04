@@ -2,6 +2,14 @@
 
 Findings from reading the actual v2 transport code, to scope the L1 patch (DESIGN.md §9).
 
+> **Status [2026-07-03].** The **decoy channel is BUILT** — rows **B/B'/C** of §6 — but the
+> control API (C) landed as **RPC** (`senddecoy`/`getdecoys`), *not* the local IPC socket this doc
+> originally sketched. It's on Bitcoin Core **v29.3** (not the commit pinned below), captured in
+> `patches/bip324-decoy.patch` + `scripts/build-patched-node.sh` and driven by `transport::bip324`;
+> see `docs/DEPLOYMENT.md` and `tests/bip324.rs`. Points where this scoping doc diverges from the
+> built code are flagged **[BUILT: …]** inline. Rows **A/A'** (garbage = membership signaling) and
+> the probe-resistant rendezvous remain **research / not built** — that content is still forward-looking.
+
 > **Source pinned:** github.com/bitcoin/bitcoin @ `dc282ff31d1cc97507530a541d9cec8a8f6a6ef4`
 > (HEAD, 2026-06-30). Line numbers below are at this commit and **will drift** — treat
 > them as "find the function named X," not gospel.
@@ -82,8 +90,10 @@ augmenting `GenerateRandomGarbage()`.
   `m_send_buffer` (when idle, or between real messages). Cleanest hook is around the
   `SetMessageToSend`/`GetBytesToSend` boundary in `SocketSendData` so decoys ride the normal
   send loop. Their empty `msg_type` already excludes them from per-type stats (`net.cpp:1656`).
-- **Receive:** at `net.cpp:1254`, when `ignore==true`, test `m_recv_decode_buffer` for our
-  frame magic; if it matches, route to the covert API instead of dropping.
+- **Receive:** at the `ignore==true` branch, capture `m_recv_decode_buffer` for the covert API
+  instead of dropping. **[BUILT:** we capture **every** decoy into a per-transport `m_recv_decoys`
+  queue drained by `getdecoys` — no frame-magic filter; frame parsing lives above, in
+  `transport::bip324`.**]**
 
 **Crucial visibility fact:** decoy *content* is AEAD-encrypted, so a passive wire observer
 **cannot** distinguish a decoy from a real message — only packet **size / count / timing**
@@ -130,7 +140,7 @@ by design. **Prefer decoys; keep this as a fallback.**
 | A'| **Garbage detect** (recv): test peer garbage against PRF | `ProcessReceivedGarbageBytes` `net.cpp:1185` |
 | B | **Decoy emit** (send): queue covert frames, `Encrypt(..., ignore=true)`, interleave | `SocketSendData` `net.cpp:~1620`; new state in `V2Transport` |
 | B'| **Decoy route** (recv): on `ignore==true`, match frame magic → covert API | `ProcessReceivedPacketBytes` `net.cpp:1254` |
-| C | **Covert API**: local IPC socket (NOT RPC) — send/recv opaque frames keyed by NodeId, request covert session to a peer | new module; bridges to A/B; `AddConnection` for session setup |
+| C | **Covert API**: send/recv opaque frames keyed by NodeId. **[BUILT as RPC** `senddecoy`/`getdecoys` — the earlier "IPC not RPC" preference was dropped: the control plane is local and never on the wire, so RPC is fine (DESIGN §9).**]** | `rpc/net.cpp` + `CConnman::SendDecoy`/`GetDecoys` |
 
 Confined to `net.{h,cpp}` (+ a small new IPC module). Untouched: consensus, validation,
 mempool, wallet — keeps the fork tractable across rebases.
@@ -160,7 +170,7 @@ For v1 (deliberate direct two-party), the garbage membership-auth (A/A') is **op
 - That reduces the v1 patch to **B + B' + C** (decoy send/recv + local API). Garbage
   injection (A/A') and opportunistic/probe-resistant rendezvous belong to the v2 overlay.
 
-So: **v1 patch ≈ decoy channel + local socket. Rendezvous-in-garbage is a v2 concern.**
+So: **v1 patch ≈ decoy channel + control RPC (BUILT). Rendezvous-in-garbage is a v2 concern.**
 
 ---
 

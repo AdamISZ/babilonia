@@ -1,12 +1,8 @@
-//! The two sigma-protocol obligations, behind a trait so the plumbing can run **assume-valid**
-//! first and swap in real proofs later (build order: stub → real `π_r` → `π_a` hash-circuit).
-//!
-//! - `π_a` (Alice): `H_k` derived correctly from committed `A_k`, and `X` bound to **one**
-//!   `A_{i*}`. Generalized Schnorr + a DLEQ-OR, plus the *only* in-circuit hash: the two
-//!   `hash_p(A_k)` evaluations. `hash_p` is an **internal** hash (not consensus `hash160`),
-//!   so we are free to pick a proof-friendly instantiation later.
-//! - `π_r` (Bob): `K_b` uses exactly one of `{H_1,H_2}` (blinds `j*`) plus `dlog(P_b)`.
-//!   Pure generalized Schnorr — **no hash circuit**. This is the one to make real first.
+//! **Superseded / vestigial.** The real proofs are the hash-free sigma protocols in
+//! [`crate::sigma`] — `π_a` = two Schnorr PoKs on the thimbles, `π_r` = a CDS 1-of-2 OR —
+//! generated and verified inline by `setup`. This module is only the old assume-valid `Verifier`
+//! seam, still referenced by the `protocol` skeleton; the live `setup` path does not use it.
+//! `AssumeValid` accepts everything and **must not** ship.
 
 use crate::Result;
 

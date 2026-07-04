@@ -1,5 +1,14 @@
 # Babilonia Wire Protocol
 
+> **⚠ SUPERSEDED BY v5 (2026-07-04).** The handshake and single s-value adaptor described below are
+> **pre-v5**. The real protocol (`adaptor_construction_spec_v5.tex`) is a 6-step flow P1–P6 over
+> **one** output: settlement = MuSig2 adaptor on `D = d·G`; encrypted outcome `ctxt = a_c + H(d)`
+> (thimbles `A_i = a_i·G`); `π_a` = Σ-part + hash circuit. The **crypto and tx layers are built to
+> v5** (`src/txgraph.rs`, `src/reveal.rs`, `src/sigma.rs`), but the **message flow in this doc and
+> in `src/messages.rs`/`src/setup.rs` is not yet reworked** — the next step, after which the flight
+> details below get rewritten to v5's P1–P6.
+
+
 > Status: **hash-free / reordered redesign** (2026-07-02). Setup is a **3-flight fused** exchange
 > (Alice → Bob → Alice); the proofs are secp256k1 **sigma protocols** (only `π_r` is an OR). The
 > code (`src/messages.rs`, `src/setup.rs`, `src/reveal.rs`, `src/txgraph.rs`) still reflects the
@@ -8,7 +17,7 @@
 > Layer: L1 interactive setup (DESIGN §9), carried as discrete **frames** over a
 > `transport::Transport` (medium — BIP324 covert channel, TCP, in-memory — is pluggable, out of
 > scope here). Cryptographic meaning of each field: `JOIN-CONSTRUCTION.md` §1–§5. Formal note:
-> `adaptor_construction_spec (1).tex`.
+> `adaptor_construction_spec_v5.tex`.
 
 ---
 
@@ -170,7 +179,8 @@ identical templates and sighashes.
 > MuSig2 partial that never references `H_c`**, so he can sign it in flight 2 before `c` is
 > revealed — this is what makes the 3-flight ordering possible. SettleBobWins's adaptor point `K`
 > is known to both parties, so it may use the ordinary nonce-adaptor. *(Code note: the `musig2`
-> crate's adaptor is the nonce form; ChallengeTx needs the s-value form implemented.)*
+> crate's adaptor is the nonce form; the s-value form is implemented on top of it as
+> `musig::svalue_presig`/`svalue_reveal` and exercised in `tests/regtest_e2e.rs`.)*
 
 - `Q_fund` and `Q'` share `Q` (differ only by outpoint).
 - The three spends of `Q'` are mutually exclusive; the relative timelock on SettleAliceWins gives

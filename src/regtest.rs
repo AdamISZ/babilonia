@@ -1,7 +1,8 @@
 //! Regtest harness: spawn a throwaway `bitcoind` (v31) on a temp datadir, drive it over RPC,
 //! and tear it down on `Drop`. Hermetic — no external node required — so the e2e in
-//! `tests/regtest_e2e.rs` is a reusable baseline. Proofs run `AssumeValid`; this layer proves
-//! the tx graph is actually relay/consensus-accepted, and exercises witness assembly.
+//! `tests/regtest_e2e.rs` is a reusable baseline: it proves the tx graph is actually
+//! relay/consensus-accepted and exercises witness assembly. (The sigma proofs are covered by
+//! `sigma`'s unit tests and the `tests/bip324.rs` handshake, not here.)
 
 use std::net::TcpListener;
 use std::path::PathBuf;

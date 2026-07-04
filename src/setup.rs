@@ -1,222 +1,326 @@
-//! Interactive setup driver (hash-free, Bob-commits-first): Alice and Bob play the commit-blind
-//! exchange over any [`Transport`], ending with a shared public view and the aggregated key
-//! `Q = MuSig2(P_a, P_b)` (JOIN-CONSTRUCTION §3, PROTOCOL.md §2–§3).
+//! The v5 setup driver (`adaptor_construction_spec_v5.tex`, P1–P6): a four-flight interactive
+//! exchange over a [`Transport`] that pre-signs the tx graph (the refund, and the settlement
+//! adaptor pre-signature locked to `D`) and commits the encrypted outcome `ctxt = a_c + H(d)`.
 //!
-//! Alice sends her thimbles first (`Open`); Bob commits his pick (`Accept`: `K`, `π_r`) — this is
-//! the commit-blind order (Alice's adaptor pre-signature does not exist yet, so nothing leaks
-//! her choice). Proof verification goes through a [`Verifier`] (AssumeValid for now). The
-//! pre-signing/funding flights are a later stage that consumes this state.
+//! `π_a` is produced/verified as its **Σ-part only** here (`sigma::prove_adaptor`); the hash
+//! conjunct is stubbed (`sigma::prove_recovery_circuit`), so this is the "everything works with the
+//! π_a ZKP stubbed" waypoint. `π_r` and the thimble PoKs are real. Two MuSig2 sessions run over the
+//! flights: the **refund** (plain) and the **settlement** (adaptor on `D`), both single-input.
 //!
-//! **Two Bob keys.** Bob's *funding* key `P_b` is public (it enters `Q`); his *claim* key `W_b`
-//! is hidden and only appears blinded in `K = W_b + H_y`. If `K` reused `P_b`, Alice would
-//! recover it from `Q` and learn `y` — so they must differ.
+//! On success each side holds the same pre-signed settlement (Alice can `adapt` it with `d` and
+//! broadcast → reveals `d`; Bob then `extract`s `d` and decrypts `a_c`) and the same refund.
 
+use bitcoin::{absolute::LockTime, Amount, OutPoint, Transaction, TxOut, XOnlyPublicKey};
 use musig2::secp::{Point, Scalar};
+use musig2::{AdaptorSignature, LiftedSignature};
 
 use crate::keys::Keypair;
-use crate::messages::{Accept, Open};
+use crate::messages::{AliceOpen, AliceReveal, BobAuth, BobCommit};
 use crate::musig::KeyAgg;
 use crate::reveal::compute_k;
 use crate::sigma;
+use crate::txgraph::{build_refund, build_settlement, key_spend_sighash, ClaimOutput, TaprootKey};
 use crate::transport::Transport;
 use crate::{Error, Result};
 
-/// Fiat–Shamir context binding `π_a` to Alice's key.
-fn ctx_a(p_a: &Point) -> Vec<u8> {
-    p_a.serialize().to_vec()
+/// Parameters both parties agree on before the driver runs (funding + payout shape).
+#[derive(Clone, Debug)]
+pub struct GameParams {
+    /// The confirmed pot outpoint `U1` and its value.
+    pub u1_outpoint: OutPoint,
+    pub u1_value: Amount,
+    pub alice_stake: Amount,
+    pub bob_stake: Amount,
+    /// Flat per-tx fee (settlement / refund).
+    pub fee: Amount,
+    /// Refund absolute lock height `t_r`.
+    pub refund_locktime: u32,
+    /// Claim-output Alice-timeout relative lock `t_1` (blocks).
+    pub alice_timeout: u16,
 }
-/// Fiat–Shamir context binding `π_r` to both funding keys.
-fn ctx_r(p_a: &Point, p_b: &Point) -> Vec<u8> {
+
+/// Alice's private inputs.
+pub struct AliceSecrets {
+    pub identity: Keypair,
+    /// Thimble secret scalars `a_1, a_2` (thimbles `A_i = a_i·G`).
+    pub thimbles: [Scalar; 2],
+    /// Alice's secret choice `c ∈ {0,1}`.
+    pub choice: usize,
+    /// Fresh dealer decryption secret `d` (the settlement adaptor witness).
+    pub d: Scalar,
+}
+
+/// Bob's private inputs.
+pub struct BobSecrets {
+    pub funding: Keypair,
+    /// Bob's hidden claim key `W_b` (≠ funding key).
+    pub claim: Keypair,
+    /// Bob's secret guess `y ∈ {0,1}`.
+    pub guess: usize,
+}
+
+/// The pre-signed artifacts both parties end with (they agree on all of these).
+pub struct SetupResult {
+    pub keyagg: KeyAgg,
+    pub settle_tx: Transaction,
+    pub settle_sighash: [u8; 32],
+    /// Settlement adaptor pre-signature locked to `D`; Alice completes it with `d`.
+    pub settle_pre: AdaptorSignature,
+    pub refund_tx: Transaction,
+    pub refund_sighash: [u8; 32],
+    pub refund_sig: LiftedSignature,
+    pub ctxt: Scalar,
+    /// `D = d·G`.
+    pub d_point: Point,
+    /// `K = W_b + A_y`.
+    pub k: Point,
+    pub thimbles: [Point; 2],
+}
+
+fn ctx_keys(p_a: &Point, p_b: &Point) -> Vec<u8> {
     let mut v = p_a.serialize().to_vec();
     v.extend_from_slice(&p_b.serialize());
     v
 }
 
-/// Game parameters Alice fixes in her opening offer (Bob adds his stake in `Accept`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GameParams {
-    pub alice_stake: u64,
-    pub delta: u64,
-    pub reveal_window: u16,
-    pub refund_locktime: u32,
+fn x_only(p: &secp256k1::PublicKey) -> Result<XOnlyPublicKey> {
+    XOnlyPublicKey::from_slice(&p.serialize()[1..33]).map_err(|_| Error::Protocol("bad x-only key"))
 }
 
-/// Alice's private setup inputs.
-pub struct AliceSecrets {
-    /// Public identity/funding key `P_a`.
-    pub identity: Keypair,
-    /// The two thimble secret scalars `h_1, h_2` (thimbles are `H_i = h_i·G`).
-    pub thimbles: [Scalar; 2],
-    /// Alice's secret choice `c ∈ {0,1}`.
-    pub choice: usize,
+/// Build the (identical, on both sides) settlement + refund txs and their key-spend sighashes for
+/// the pot `u1` given the claim key `k`.
+fn tx_graph(
+    u1: &TaprootKey,
+    p_a: &secp256k1::PublicKey,
+    k: &Point,
+    params: &GameParams,
+) -> Result<(Transaction, [u8; 32], ClaimOutput, Transaction, [u8; 32])> {
+    let prevout = u1.txout(params.u1_value);
+    let claim = ClaimOutput::new(*k, x_only(p_a)?, params.alice_timeout)?;
+    let pot = params.u1_value.checked_sub(params.fee).ok_or(Error::Protocol("fee exceeds pot"))?;
+    let settle_tx = build_settlement(params.u1_outpoint, vec![claim.txout(pot)]);
+    let settle_sighash = key_spend_sighash(&settle_tx, 0, &[prevout.clone()])?;
+
+    let refund_locktime = LockTime::from_height(params.refund_locktime)
+        .map_err(|_| Error::Protocol("bad refund locktime"))?;
+    let alice_out = TxOut { value: params.alice_stake, script_pubkey: u1.spk.clone() };
+    let bob_out = TxOut { value: params.bob_stake, script_pubkey: u1.spk.clone() };
+    let refund_tx = build_refund(params.u1_outpoint, alice_out, bob_out, refund_locktime);
+    let refund_sighash = key_spend_sighash(&refund_tx, 0, &[prevout])?;
+    Ok((settle_tx, settle_sighash, claim, refund_tx, refund_sighash))
 }
 
-/// Bob's private setup inputs.
-pub struct BobSecrets {
-    /// Public funding key `P_b` (enters `Q`).
-    pub funding: Keypair,
-    /// Hidden claim key `W_b` (`K = W_b + H_y`).
-    pub claim: Keypair,
-    /// Guess `y ∈ {0,1}`.
-    pub guess: usize,
-    pub stake: u64,
-}
-
-/// Shared public result of setup — identical on both sides.
-pub struct SetupState {
-    pub params: GameParams,
-    pub bob_stake: u64,
-    pub p_a: Point,
-    /// Bob's public funding key.
-    pub p_b: Point,
-    /// Thimbles `[H_1, H_2]`.
-    pub h: [Point; 2],
-    /// Bob's pot-claim key `K = W_b + H_y`.
-    pub k: Point,
-    /// `Q = MuSig2(P_a, P_b)` with the key-path taproot tweak.
-    pub keyagg: KeyAgg,
-}
-
-/// Run Alice's side: send her thimbles (with `π_a`), receive and verify Bob's commitment (`π_r`).
-pub fn run_alice<T: Transport>(
-    ch: &mut T,
-    params: GameParams,
-    s: &AliceSecrets,
-) -> Result<SetupState> {
+/// Run Alice's side (signer index 0).
+pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets) -> Result<SetupResult> {
     let p_a: Point = s.identity.pk.into();
-    let [h1, h2] = s.thimbles.map(|h| h.base_point_mul());
-    let pi_a = sigma::prove_pi_a(&s.thimbles, &ctx_a(&p_a));
+    let thimbles = s.thimbles.map(|a| a.base_point_mul());
+    let [a1, a2] = thimbles;
 
+    // Flight 1 (P2): thimbles + PoKs.
     ch.send(
-        &Open {
-            alice_stake: params.alice_stake,
-            delta: params.delta,
-            reveal_window: params.reveal_window,
-            refund_locktime: params.refund_locktime,
+        &AliceOpen {
             p_a,
-            h1,
-            h2,
-            pi_a,
+            a1,
+            a2,
+            thimble_poks: sigma::prove_thimble_poks(&s.thimbles, &p_a.serialize()),
         }
         .encode(),
     )?;
 
-    let accept = Accept::decode(&ch.recv()?)?;
-    if !sigma::verify_pi_r(&accept.k, &[h1, h2], &ctx_r(&p_a, &accept.p_b), &accept.pi_r) {
+    // Flight 2 (P3): Bob's key, K, π_r, nonces.
+    let commit = BobCommit::decode(&ch.recv()?)?;
+    let ctx = ctx_keys(&p_a, &commit.p_b);
+    if !sigma::verify_pi_r(&commit.k, &thimbles, &ctx, &commit.pi_r) {
         return Err(Error::ProofInvalid("pi_r"));
     }
+    let p_b_pub: secp256k1::PublicKey = commit.p_b.into();
+    let u1 = TaprootKey::new(s.identity.pk, p_b_pub)?;
+    let (settle_tx, settle_sighash, _claim, refund_tx, refund_sighash) =
+        tx_graph(&u1, &s.identity.pk, &commit.k, params)?;
 
-    let p_b_pub: secp256k1::PublicKey = accept.p_b.into();
-    let keyagg = KeyAgg::new_taproot([s.identity.pk, p_b_pub])?;
+    // Alice's MuSig2 sessions (distinct fresh seeds — nonce hygiene).
+    let (r1_refund, refund_nonce) = u1.keyagg.first_round(0, s.identity.sk, fresh_seed())?;
+    let (r1_settle, settle_nonce) = u1.keyagg.first_round(0, s.identity.sk, fresh_seed())?;
+    let d_point = s.d.base_point_mul();
+    let (mut r2_refund, refund_partial) = r1_refund.sign(1, commit.refund_nonce, s.identity.sk, refund_sighash)?;
+    let (mut r2_settle, settle_partial) =
+        r1_settle.sign_adaptor(1, commit.settle_nonce, s.identity.sk, d_point, settle_sighash)?;
 
-    Ok(SetupState {
-        params,
-        bob_stake: accept.bob_stake,
-        p_a,
-        p_b: accept.p_b,
-        h: [h1, h2],
-        k: accept.k,
-        keyagg,
+    // The encrypted outcome + π_a (Σ-part; hash conjunct stubbed).
+    let a_c = &s.thimbles[s.choice];
+    let ctxt = (*a_c + sigma::h_p(&s.d)).unwrap();
+    let blind = Scalar::from(Keypair::new(&secp256k1::Secp256k1::new()).sk);
+    let pi_a = sigma::prove_adaptor(a_c, &blind, &s.d, s.choice, &thimbles, &d_point, &ctx)?.to_bytes();
+
+    // Flight 3 (P4).
+    ch.send(
+        &AliceReveal { refund_nonce, settle_nonce, ctxt, d_point, pi_a, refund_partial, settle_partial }.encode(),
+    )?;
+
+    // Flight 4 (P5): Bob's partials complete both sessions.
+    let auth = BobAuth::decode(&ch.recv()?)?;
+    r2_refund.receive(1, auth.refund_partial)?;
+    r2_settle.receive(1, auth.settle_partial)?;
+    let refund_sig = r2_refund.finalize_plain()?;
+    let settle_pre = r2_settle.finalize()?;
+
+    Ok(SetupResult {
+        keyagg: u1.keyagg,
+        settle_tx,
+        settle_sighash,
+        settle_pre,
+        refund_tx,
+        refund_sighash,
+        refund_sig,
+        ctxt,
+        d_point,
+        k: commit.k,
+        thimbles,
     })
 }
 
-/// Run Bob's side: receive + verify Alice's thimbles (`π_a`), commit his pick (with `π_r`).
-pub fn run_bob<T: Transport>(ch: &mut T, s: &BobSecrets) -> Result<SetupState> {
+/// Run Bob's side (signer index 1).
+pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) -> Result<SetupResult> {
     if s.guess >= 2 {
-        return Err(Error::Protocol("guess out of range (expected 0 or 1)"));
+        return Err(Error::Protocol("guess out of range"));
     }
-
-    let open = Open::decode(&ch.recv()?)?;
-    if open.h1 == open.h2 {
-        return Err(Error::Protocol("degenerate thimbles: H_1 == H_2"));
+    // Flight 1 (P2): Alice's thimbles + PoKs.
+    let open = AliceOpen::decode(&ch.recv()?)?;
+    if open.a1 == open.a2 {
+        return Err(Error::Protocol("degenerate thimbles: A_1 == A_2"));
     }
-    let h = [open.h1, open.h2];
-    if !sigma::verify_pi_a(&h, &ctx_a(&open.p_a), &open.pi_a) {
-        return Err(Error::ProofInvalid("pi_a"));
+    let thimbles = [open.a1, open.a2];
+    if !sigma::verify_thimble_poks(&thimbles, &open.p_a.serialize(), &open.thimble_poks) {
+        return Err(Error::ProofInvalid("thimble PoKs"));
     }
 
     let p_b: Point = s.funding.pk.into();
-    let w_b_point: Point = s.claim.pk.into();
+    let w_b: Point = s.claim.pk.into();
+    let k = compute_k(&w_b, &thimbles[s.guess])?; // K = W_b + A_y
+    let ctx = ctx_keys(&open.p_a, &p_b);
     let w_b_scalar: Scalar = s.claim.sk.into();
-    let k = compute_k(&w_b_point, &h[s.guess])?; // K = W_b + H_y
-    let pi_r = sigma::prove_pi_r(&w_b_scalar, s.guess, &k, &h, &ctx_r(&open.p_a, &p_b))?;
-
-    ch.send(&Accept { bob_stake: s.stake, p_b, k, pi_r }.encode())?;
+    let pi_r = sigma::prove_pi_r(&w_b_scalar, s.guess, &k, &thimbles, &ctx)?;
 
     let p_a_pub: secp256k1::PublicKey = open.p_a.into();
-    let keyagg = KeyAgg::new_taproot([p_a_pub, s.funding.pk])?;
+    let u1 = TaprootKey::new(p_a_pub, s.funding.pk)?;
+    let (settle_tx, settle_sighash, _claim, refund_tx, refund_sighash) =
+        tx_graph(&u1, &p_a_pub, &k, params)?;
 
-    Ok(SetupState {
-        params: GameParams {
-            alice_stake: open.alice_stake,
-            delta: open.delta,
-            reveal_window: open.reveal_window,
-            refund_locktime: open.refund_locktime,
-        },
-        bob_stake: s.stake,
-        p_a: open.p_a,
-        p_b,
-        h,
+    // Bob's sessions + nonces.
+    let (r1_refund, refund_nonce) = u1.keyagg.first_round(1, s.funding.sk, fresh_seed())?;
+    let (r1_settle, settle_nonce) = u1.keyagg.first_round(1, s.funding.sk, fresh_seed())?;
+
+    // Flight 2 (P3).
+    ch.send(&BobCommit { p_b, k, pi_r, refund_nonce, settle_nonce }.encode())?;
+
+    // Flight 3 (P4): Alice's nonces, ctxt, D, π_a, partials.
+    let reveal = AliceReveal::decode(&ch.recv()?)?;
+    if !sigma::verify_adaptor_bytes(&reveal.pi_a, &thimbles, &reveal.d_point, &ctx) {
+        return Err(Error::ProofInvalid("pi_a"));
+    }
+    let (mut r2_refund, refund_partial) = r1_refund.sign(0, reveal.refund_nonce, s.funding.sk, refund_sighash)?;
+    let (mut r2_settle, settle_partial) =
+        r1_settle.sign_adaptor(0, reveal.settle_nonce, s.funding.sk, reveal.d_point, settle_sighash)?;
+
+    // Flight 4 (P5).
+    ch.send(&BobAuth { refund_partial, settle_partial }.encode())?;
+
+    r2_refund.receive(0, reveal.refund_partial)?;
+    r2_settle.receive(0, reveal.settle_partial)?;
+    let refund_sig = r2_refund.finalize_plain()?;
+    let settle_pre = r2_settle.finalize()?;
+
+    Ok(SetupResult {
+        keyagg: u1.keyagg,
+        settle_tx,
+        settle_sighash,
+        settle_pre,
+        refund_tx,
+        refund_sighash,
+        refund_sig,
+        ctxt: reveal.ctxt,
+        d_point: reveal.d_point,
         k,
-        keyagg,
+        thimbles,
     })
+}
+
+fn fresh_seed() -> [u8; 32] {
+    use rand::RngCore;
+    let mut s = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut s);
+    s
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reveal::claim_secret;
+    use crate::musig::{adapt, extract};
+    use crate::reveal::{claim_secret, recover_a_c, won};
     use crate::transport::memory::channel_pair;
 
-    fn scalar(secp: &secp256k1::Secp256k1<secp256k1::All>) -> Scalar {
-        Scalar::from(Keypair::new(secp).sk)
+    fn scalar() -> Scalar {
+        let secp = secp256k1::Secp256k1::new();
+        Scalar::from(Keypair::new(&secp).sk)
     }
 
+    /// The full v5 setup runs over the transport (π_a Σ-part real, hash conjunct stubbed): both
+    /// sides agree on the pre-signed settlement + refund, Alice completes the settlement with `d`,
+    /// and Bob recovers `a_c` and his claim key `K`.
     #[test]
-    fn setup_handshake_agrees() {
+    fn v5_setup_flow_over_transport() {
         let secp = secp256k1::Secp256k1::new();
-
         let c = 1usize;
-        let thimbles = [scalar(&secp), scalar(&secp)];
-        let h_chosen = thimbles[c].base_point_mul();
-        let alice = AliceSecrets { identity: Keypair::new(&secp), thimbles, choice: c };
+        let alice = AliceSecrets {
+            identity: Keypair::new(&secp),
+            thimbles: [scalar(), scalar()],
+            choice: c,
+            d: scalar(),
+        };
         let bob = BobSecrets {
             funding: Keypair::new(&secp),
             claim: Keypair::new(&secp),
             guess: c, // a winning guess
-            stake: 100_000,
         };
-        // Snapshots for the post-run check (Scalar/Point are Copy).
+        let params = GameParams {
+            u1_outpoint: OutPoint { txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()), vout: 0 },
+            u1_value: Amount::from_sat(500_000),
+            alice_stake: Amount::from_sat(250_000),
+            bob_stake: Amount::from_sat(248_000),
+            fee: Amount::from_sat(2_000),
+            refund_locktime: 200,
+            alice_timeout: 6,
+        };
+        // Snapshots for the post-run check.
+        let d = alice.d;
+        let a_c = alice.thimbles[c];
         let w_b = Scalar::from(bob.claim.sk);
-        let params = GameParams { alice_stake: 100_000, delta: 10_000, reveal_window: 6, refund_locktime: 200 };
 
         let (mut alice_ch, mut bob_ch) = channel_pair();
-        let bob_handle = std::thread::spawn(move || run_bob(&mut bob_ch, &bob));
-        let a_state = run_alice(&mut alice_ch, params, &alice).unwrap();
-        let b_state = bob_handle.join().unwrap().unwrap();
+        let params_b = params.clone();
+        let bob_handle = std::thread::spawn(move || run_bob(&mut bob_ch, &params_b, &bob));
+        let a = run_alice(&mut alice_ch, &params, &alice).unwrap();
+        let b = bob_handle.join().unwrap().unwrap();
 
-        // Identical shared view.
-        assert_eq!(a_state.keyagg.agg_xonly(), b_state.keyagg.agg_xonly());
-        assert_eq!(a_state.p_a, b_state.p_a);
-        assert_eq!(a_state.p_b, b_state.p_b);
-        assert_eq!(a_state.h, b_state.h);
-        assert_eq!(a_state.k, b_state.k);
-        assert_eq!(a_state.params, b_state.params);
-        assert_eq!(a_state.bob_stake, b_state.bob_stake);
+        // Both sides agree on the shared artifacts.
+        assert_eq!(a.settle_sighash, b.settle_sighash);
+        assert_eq!(a.ctxt, b.ctxt);
+        assert_eq!(a.d_point, b.d_point);
+        assert_eq!(a.k, b.k);
 
-        // Bob guessed c: K is built against the chosen thimble, and equals W_b + H_c.
-        assert_eq!(b_state.h[c], h_chosen);
-        assert_eq!(b_state.k, compute_k(&w_b.base_point_mul(), &h_chosen).unwrap());
-        // The claim secret w_b + h_c has K as its public key (Bob could claim on a win).
-        assert_eq!(
-            claim_secret(&w_b, &thimbles[c]).unwrap().base_point_mul(),
-            b_state.k
-        );
+        // Alice completes the settlement with d → a valid BIP340 sig for Q; Bob extracts d from it
+        // (using his own pre-sig), decrypts a_c, and confirms his win + claim key.
+        let final_sig = adapt(&a.settle_pre, &d).expect("adapt with d");
+        musig2::verify_single(a.keyagg.agg_point(), final_sig, a.settle_sighash)
+            .expect("completed settlement is a valid key-path signature");
+        let d_bob = extract(&b.settle_pre, &final_sig).unwrap().unwrap();
+        assert_eq!(d_bob, d, "Bob extracts d");
+        let a_c_bob = recover_a_c(&b.ctxt, &d_bob).unwrap();
+        assert_eq!(a_c_bob, a_c, "Bob decrypts a_c");
+        assert!(won(&a_c_bob, &b.thimbles[c]));
+        assert_eq!(claim_secret(&w_b, &a_c_bob).unwrap().base_point_mul(), b.k, "K spendable");
 
-        // Alice cannot recover y: she holds K, P_b, H_1, H_2 but not W_b, and K − P_b ≠ H_y.
-        let p_b: Point = b_state.p_b;
-        for hy in b_state.h {
-            assert_ne!((a_state.k + (-(p_b))).not_inf().ok(), Some(hy));
-        }
+        // The refund is a valid signature too.
+        musig2::verify_single(a.keyagg.agg_point(), a.refund_sig, a.refund_sighash).expect("refund valid");
     }
 }
