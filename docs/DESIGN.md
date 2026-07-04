@@ -9,10 +9,13 @@
 > (`ctxt = a_c + H(d)`, RO pad — a linear pad leaks `c`) and, if he won (`a_c·G = A_y`), claims
 > `K = W_b + A_y`. `π_a` = a **Σ-part** (a committed `a_c` is one published thimble — built) + **one
 > hash circuit** (binds `ctxt` to `a_c`; Bulletproofs vs cut-and-choose TBD). Thimbles are now
-> `A_i = a_i·G` (freeing `H` for the hash). **Built + regtest-validated:** `txgraph` (single-output
-> graph), `reveal` (the `d`→`a_c` reveal), `sigma` (`π_a` Σ-part / `π_r` / thimble PoKs).
-> **Pending:** the hash circuit and the v5 message flow. Treat single-adaptor / two-output passages
-> below (and `H_i`/`h_c` notation) as stale until the rewrite lands.
+> `A_i = a_i·G` (freeing `H` for the hash). **Built + regtest-validated (2026-07-04) — the whole v5
+> stack:** `txgraph` (single-output graph), `reveal` (`d`→`a_c`), `sigma` (`π_a` Σ-part / `π_r` /
+> thimble PoKs), the **v5 four-flight message flow** (`messages`/`setup`), **joint PSBT funding**,
+> and a stratified game runner — `game` (business logic) over `bet`/`node` (bitcoin translation) —
+> playable single-process (`regtest-game` bin) and **across two nodes over the real BIP324 covert
+> channel** (`party` bin). **Only pending:** the `π_a` hash circuit (Bulletproofs vs cut-and-choose).
+> Treat single-adaptor / two-output passages below (and `H_i`/`h_c` notation) as stale.
 
 > Status: early architecture. This is a living spine to mark up, not a spec.
 > Tags used below: **[DECIDED]** settled direction · **[FOCUS]** current build target ·

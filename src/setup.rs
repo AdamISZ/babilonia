@@ -75,6 +75,8 @@ pub struct SetupResult {
     /// `K = W_b + A_y`.
     pub k: Point,
     pub thimbles: [Point; 2],
+    /// Alice's funding key `P_a` (both know it; needed to rebuild the claim output).
+    pub p_a: Point,
 }
 
 fn ctx_keys(p_a: &Point, p_b: &Point) -> Vec<u8> {
@@ -176,6 +178,7 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
         d_point,
         k: commit.k,
         thimbles,
+        p_a,
     })
 }
 
@@ -242,6 +245,7 @@ pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) ->
         d_point: reveal.d_point,
         k,
         thimbles,
+        p_a: open.p_a,
     })
 }
 

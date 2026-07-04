@@ -6,9 +6,10 @@
 > posts the fresh dealer secret `d`); `RefundTx` at `t_r`; the winner `K = W_b + A_y` claims via a
 > taproot `<K>` leaf, Alice reclaims via a `t_1` timeout leaf. The outcome is a hash-padded
 > ciphertext `ctxt = a_c + H(d)` (thimbles `A_i = a_i·G`); Bob extracts `d`, gets `a_c = ctxt − H(d)`.
-> `π_a` = Σ-part (built) + one hash circuit (TBD). **Implemented + regtest-validated to v5:**
-> `src/txgraph.rs`, `src/reveal.rs`, `src/sigma.rs`. This document's construction details are pre-v5
-> and scheduled for rewrite with the message layer.
+> `π_a` = Σ-part (built) + one hash circuit (the **only** stubbed piece). **Implemented + regtest-
+> validated to v5:** `txgraph`, `reveal`, `sigma`, the **four-flight message layer** (`messages`/
+> `setup`), **joint PSBT funding**, and the `game`/`bet`/`node` runners (single-process + two-node
+> over the BIP324 covert channel). This document's construction details are pre-v5.
 
 
 > Status: worked cryptographic core for the **join** geometry (DESIGN.md §5, **[FOCUS]**).

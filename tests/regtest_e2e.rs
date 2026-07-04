@@ -11,7 +11,7 @@
 
 use babilonia::keys::Keypair;
 use babilonia::musig::{adapt, extract, signature_bytes};
-use babilonia::regtest::RegtestNode;
+use babilonia::node::Node;
 use babilonia::reveal::{claim_secret, compute_k, recover_a_c, won};
 use babilonia::sigma::h_p;
 use babilonia::txgraph::{
@@ -46,7 +46,7 @@ fn addr(key: &TaprootKey) -> Address {
 }
 
 struct Funded {
-    node: RegtestNode,
+    node: Node,
     secp: secp256k1::Secp256k1<secp256k1::All>,
     a: Keypair,
     b: Keypair,
@@ -56,7 +56,7 @@ struct Funded {
 }
 
 fn fund_u1() -> Funded {
-    let node = RegtestNode::start().expect("start bitcoind regtest");
+    let node = Node::regtest().expect("start bitcoind regtest");
     let secp = secp256k1::Secp256k1::new();
     let a = Keypair::new(&secp);
     let b = Keypair::new(&secp); // Bob's funding key (in Q)

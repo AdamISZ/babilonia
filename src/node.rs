@@ -1,8 +1,11 @@
-//! Regtest harness: spawn a throwaway `bitcoind` (v31) on a temp datadir, drive it over RPC,
-//! and tear it down on `Drop`. Hermetic — no external node required — so the e2e in
-//! `tests/regtest_e2e.rs` is a reusable baseline: it proves the tx graph is actually
-//! relay/consensus-accepted and exercises witness assembly. (The sigma proofs are covered by
-//! `sigma`'s unit tests and the `tests/bip324.rs` handshake, not here.)
+//! A `Node`: a party's local Bitcoin stack — the bitcoind RPC (wallet + network), the network
+//! type, the p2p address, peering, and the BIP324 covert transport to a peer. It is the
+//! infrastructure the **node layer** builds bet transactions on; the `game` layer (business logic)
+//! only ever talks to a `Node`, never to bitcoin transactions directly.
+//!
+//! Two flavours: [`Node::regtest`] spawns a throwaway `bitcoind` it owns (killed on `Drop`) — the
+//! hermetic baseline for tests — and [`Node::connect`] attaches to an already-running node (real
+//! deployments, the two-window runner). Requires the `node` feature.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -18,16 +21,21 @@ use crate::{Error, Result};
 
 static INSTANCE: AtomicU32 = AtomicU32::new(0);
 
-/// A self-managed regtest `bitcoind` with a loaded wallet. Killed and cleaned up on drop.
-/// P2P listening and BIP324 v2 transport are enabled, so two nodes can peer over v2.
-pub struct RegtestNode {
-    child: Child,
-    datadir: PathBuf,
+/// A party's local Bitcoin node — RPC/wallet access, network type, p2p address, and the BIP324
+/// covert transport to a peer. Owns its `bitcoind` process only when it spawned one.
+pub struct Node {
+    /// Bitcoin network (Regtest for the current runner; parametrised for later).
+    network: Network,
     /// P2P listen port (for peering two nodes).
     p2p_port: u16,
     /// Base RPC URL and cookie path (to mint fresh clients via `new_rpc_client`).
     rpc_url: String,
     cookie: PathBuf,
+    /// The loaded wallet name (for minting per-thread wallet clients).
+    wallet: String,
+    /// A spawned `bitcoind` we own (killed on `Drop`); `None` when attached to an existing node.
+    child: Option<Child>,
+    datadir: Option<PathBuf>,
     /// Wallet-scoped RPC client (also serves non-wallet calls).
     pub client: Client,
 }
@@ -38,16 +46,75 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-impl RegtestNode {
+impl Node {
     /// Spawn `bitcoind -regtest` (the binary named by `$BABILONIA_BITCOIND`, else `bitcoind`),
-    /// wait for RPC, create + load a wallet, and mine to maturity.
-    pub fn start() -> Result<Self> {
+    /// wait for RPC, create + load a wallet, and mine to maturity. The spawned node is owned and
+    /// killed on `Drop`.
+    pub fn regtest() -> Result<Self> {
         let bin = std::env::var("BABILONIA_BITCOIND").unwrap_or_else(|_| "bitcoind".into());
-        Self::start_with_binary(&bin)
+        Self::regtest_with_binary(&bin)
     }
 
-    /// Like [`start`](Self::start) but with an explicit `bitcoind` path (e.g. a patched build).
-    pub fn start_with_binary(bitcoind: &str) -> Result<Self> {
+    /// Attach to an already-running node (not owned; not killed on drop). `base_url` is the RPC
+    /// base (no `/wallet/...`); `wallet` is loaded/scoped for wallet calls; `p2p_port` is the
+    /// node's advertised P2P port (for peering).
+    pub fn connect(base_url: &str, cookie: PathBuf, network: Network, p2p_port: u16, wallet: &str) -> Result<Self> {
+        let client = Client::new(&format!("{base_url}/wallet/{wallet}"), Auth::CookieFile(cookie.clone()))?;
+        client.get_blockchain_info()?; // fail fast if unreachable
+        Ok(Node {
+            network,
+            p2p_port,
+            rpc_url: base_url.to_string(),
+            cookie,
+            wallet: wallet.to_string(),
+            child: None,
+            datadir: None,
+            client,
+        })
+    }
+
+    /// A fresh **wallet-scoped** RPC client — hand one to each concurrent party so they don't share
+    /// a single `Client` across threads.
+    pub fn wallet_client(&self) -> Result<Client> {
+        self.named_wallet_client(&self.wallet)
+    }
+
+    fn named_wallet_client(&self, name: &str) -> Result<Client> {
+        Ok(Client::new(
+            &format!("{}/wallet/{}", self.rpc_url, name),
+            Auth::CookieFile(self.cookie.clone()),
+        )?)
+    }
+
+    /// Create a fresh wallet on this node, fund it with `amount` from the primary wallet (mined in),
+    /// and return its client. Used to give each party its own wallet for joint PSBT funding.
+    pub fn create_funded_wallet(&self, name: &str, amount: Amount) -> Result<Client> {
+        self.client.create_wallet(name, None, None, None, None)?;
+        let wc = self.named_wallet_client(name)?;
+        let addr = wc
+            .get_new_address(None, None)?
+            .require_network(self.network)
+            .map_err(|_| Error::Protocol("address network mismatch"))?;
+        self.client
+            .send_to_address(&addr, amount, None, None, None, None, None, None)?;
+        self.mine(1)?;
+        Ok(wc)
+    }
+
+    /// Like [`regtest`](Self::regtest) but with an explicit `bitcoind` path (e.g. a patched build).
+    pub fn regtest_with_binary(bitcoind: &str) -> Result<Self> {
+        Self::spawn(bitcoind, true)
+    }
+
+    /// Spawn a node WITHOUT mining any initial blocks — for the *second* node in a two-node setup:
+    /// it must sync to the miner's chain rather than fork with its own coinbase. Honors
+    /// `$BABILONIA_BITCOIND`.
+    pub fn regtest_unfunded() -> Result<Self> {
+        let bin = std::env::var("BABILONIA_BITCOIND").unwrap_or_else(|_| "bitcoind".into());
+        Self::spawn(&bin, false)
+    }
+
+    fn spawn(bitcoind: &str, fund: bool) -> Result<Self> {
         let n = INSTANCE.fetch_add(1, Ordering::SeqCst);
         let datadir = std::env::temp_dir().join(format!("babilonia-regtest-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&datadir)?;
@@ -90,9 +157,25 @@ impl RegtestNode {
         node.create_wallet("bab", None, None, None, None)?;
         let client = Client::new(&format!("{url}/wallet/bab"), Auth::CookieFile(cookie.clone()))?;
 
-        let node = RegtestNode { child, datadir, p2p_port, rpc_url: url, cookie, client };
-        node.fund_wallet()?;
+        let node = Node {
+            network: Network::Regtest,
+            p2p_port,
+            rpc_url: url,
+            cookie,
+            wallet: "bab".to_string(),
+            child: Some(child),
+            datadir: Some(datadir),
+            client,
+        };
+        if fund {
+            node.fund_wallet()?;
+        }
         Ok(node)
+    }
+
+    /// This node's Bitcoin network.
+    pub fn network(&self) -> Network {
+        self.network
     }
 
     /// Build a fresh (non-wallet) RPC client to this node — e.g. to hand to a `Bip324Transport`,
@@ -106,12 +189,16 @@ impl RegtestNode {
         format!("127.0.0.1:{}", self.p2p_port)
     }
 
-    /// Add `other` as a persistent peer; Core establishes (and re-establishes) the connection.
-    pub fn connect_to(&self, other: &RegtestNode) -> Result<()> {
-        let _: serde_json::Value = self
-            .client
-            .call("addnode", &[other.p2p_addr().into(), "add".into()])?;
+    /// Add a peer by P2P address (`host:port`) persistently; Core establishes (and re-establishes)
+    /// the connection.
+    pub fn connect_to_addr(&self, addr: &str) -> Result<()> {
+        let _: serde_json::Value = self.client.call("addnode", &[addr.into(), "add".into()])?;
         Ok(())
+    }
+
+    /// Add `other` as a persistent peer.
+    pub fn connect_to(&self, other: &Node) -> Result<()> {
+        self.connect_to_addr(&other.p2p_addr())
     }
 
     /// Raw `getpeerinfo` peer array.
@@ -187,12 +274,12 @@ impl RegtestNode {
         Ok(())
     }
 
-    /// A fresh wallet address (network-checked for regtest).
+    /// A fresh wallet address (checked against this node's network).
     pub fn new_address(&self) -> Result<Address> {
         let addr = self
             .client
             .get_new_address(None, None)?
-            .require_network(Network::Regtest)
+            .require_network(self.network)
             .map_err(|_| Error::Protocol("address network mismatch"))?;
         Ok(addr)
     }
@@ -201,6 +288,25 @@ impl RegtestNode {
     pub fn mine(&self, n: u64) -> Result<()> {
         let addr = self.new_address()?;
         self.client.generate_to_address(n, &addr)?;
+        Ok(())
+    }
+
+    /// Spawn a detached thread that mines one block every `interval` — steady block production so
+    /// broadcast transactions confirm (parties just wait for confirmations). Exits when the node
+    /// goes away. In a two-node setup, run this on exactly one node to avoid chain forks.
+    pub fn spawn_miner(&self, interval: Duration) -> Result<()> {
+        let client = self.wallet_client()?;
+        let network = self.network;
+        std::thread::spawn(move || loop {
+            std::thread::sleep(interval);
+            let addr = match client.get_new_address(None, None).map(|a| a.require_network(network)) {
+                Ok(Ok(a)) => a,
+                _ => break, // node/RPC gone
+            };
+            if client.generate_to_address(1, &addr).is_err() {
+                break;
+            }
+        });
         Ok(())
     }
 
@@ -234,10 +340,15 @@ impl RegtestNode {
     }
 }
 
-impl Drop for RegtestNode {
+impl Drop for Node {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.datadir);
+        // Only tear down a node we spawned; a connected node is left running.
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(datadir) = self.datadir.as_ref() {
+            let _ = std::fs::remove_dir_all(datadir);
+        }
     }
 }

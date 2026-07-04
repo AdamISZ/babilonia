@@ -32,6 +32,16 @@ default = ["node"]
 # `default-features = false` to get the transport-agnostic core library with no RPC dependencies.
 node = ["dep:bitcoincore-rpc", "dep:serde_json"]
 
+[[bin]]
+name = "regtest-game"
+path = "src/bin/regtest_game.rs"
+required-features = ["node"]
+
+[[bin]]
+name = "party"
+path = "src/bin/party.rs"
+required-features = ["node"]
+
 [dev-dependencies]
 # Integration tests are separate crates and can't see the lib's normal deps; re-declare the two
 # needed to build protocol secrets in the BIP324 handshake test. Versions unify with the deps above.

@@ -58,8 +58,38 @@ scripts/build-patched-node.sh
 export BABILONIA_BITCOIND=~/.cache/babilonia/bitcoin/build/bin/bitcoind
 ```
 
-Pin/override with `BITCOIN_TAG`, `BITCOIN_SRC`, `BITCOIN_URL`. The Babilonia test harness and (in
-future) the BIP324 transport pick up `$BABILONIA_BITCOIND`.
+Pin/override with `BITCOIN_TAG`, `BITCOIN_SRC`, `BITCOIN_URL`. The Babilonia test harness, the BIP324
+transport, and the runner binaries all pick up `$BABILONIA_BITCOIND`.
+
+## Runners
+
+Two end-to-end runners exercise the full v5 game (both use the `node` feature; see the README for
+sample output). They sit above the layering `game` (business logic) → `node`/`bet` (bitcoin
+translation) → `txgraph`/`musig`/`sigma`/`setup` (primitives):
+
+- **`regtest-game`** — single process: spins up a throwaway regtest `bitcoind`, funds two wallets,
+  and plays a full game (joint PSBT funding → settlement → claim) over an in-memory transport. Needs
+  only a stock `bitcoind` on `PATH`.
+
+  ```sh
+  cargo run --bin regtest-game            # player wins → claims via K
+  cargo run --bin regtest-game -- --lose  # player loses → dealer reclaims after timeout
+  ```
+
+- **`party`** — the two-window / two-node covert deployment: each process drives its own `bitcoind`,
+  and the whole game (funding coordination + the four setup flights) rides the **real BIP324 decoy
+  channel** between the two peered nodes. Requires the patched build (`$BABILONIA_BITCOIND`).
+
+  ```sh
+  # window 1 (dealer + sole miner) — prints its P2P address:
+  BABILONIA_BITCOIND=… cargo run --bin party -- --role dealer
+  # window 2 (player), using the address it printed:
+  BABILONIA_BITCOIND=… cargo run --bin party -- --role player --connect <addr> [--guess 0|1]
+  ```
+
+  The dealer is the sole block producer (a background miner); the player's node spawns *unfunded* so
+  it syncs to the dealer's chain rather than forking, and the dealer funds the player's wallet over
+  the channel before play begins.
 
 ### Why the build stays covert
 

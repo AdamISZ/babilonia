@@ -3,10 +3,11 @@
 > **⚠ SUPERSEDED BY v5 (2026-07-04).** The handshake and single s-value adaptor described below are
 > **pre-v5**. The real protocol (`adaptor_construction_spec_v5.tex`) is a 6-step flow P1–P6 over
 > **one** output: settlement = MuSig2 adaptor on `D = d·G`; encrypted outcome `ctxt = a_c + H(d)`
-> (thimbles `A_i = a_i·G`); `π_a` = Σ-part + hash circuit. The **crypto and tx layers are built to
-> v5** (`src/txgraph.rs`, `src/reveal.rs`, `src/sigma.rs`), but the **message flow in this doc and
-> in `src/messages.rs`/`src/setup.rs` is not yet reworked** — the next step, after which the flight
-> details below get rewritten to v5's P1–P6.
+> (thimbles `A_i = a_i·G`); `π_a` = Σ-part + hash circuit. The **crypto, tx, AND message layers are
+> built to v5**: `src/messages.rs`/`src/setup.rs` implement v5's **four flights** plus joint PSBT
+> funding, driven by the `game`/`bet`/`node` runners (single-process and two-node over BIP324). **Only
+> the `π_a` hash circuit is stubbed.** The **3-flight hash-free flight layout described below is
+> pre-v5** and superseded by the code — read it for field-encoding conventions (§1) only.
 
 
 > Status: **hash-free / reordered redesign** (2026-07-02). Setup is a **3-flight fused** exchange

@@ -10,7 +10,7 @@
 //!   cargo test --test bip324 -- --ignored --test-threads=1 --nocapture
 
 use babilonia::keys::Keypair;
-use babilonia::regtest::RegtestNode;
+use babilonia::node::Node;
 use babilonia::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams};
 use babilonia::transport::{bip324::Bip324Transport, Transport};
 use musig2::secp::Scalar;
@@ -25,7 +25,7 @@ fn patched_bitcoind() -> String {
 }
 
 /// Poll `get_decoys` until something arrives (delivery is async), or time out.
-fn wait_for_decoy(node: &RegtestNode, peer_id: i64) -> Vec<Vec<u8>> {
+fn wait_for_decoy(node: &Node, peer_id: i64) -> Vec<Vec<u8>> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let d = node.get_decoys(peer_id).unwrap();
@@ -41,8 +41,8 @@ fn wait_for_decoy(node: &RegtestNode, peer_id: i64) -> Vec<Vec<u8>> {
 #[test]
 #[ignore = "requires bitcoind on PATH; run with --ignored"]
 fn two_nodes_connect_over_v2() {
-    let a = RegtestNode::start().expect("node A");
-    let b = RegtestNode::start().expect("node B");
+    let a = Node::regtest().expect("node A");
+    let b = Node::regtest().expect("node B");
     println!("[up]   A @ {}, B @ {}", a.p2p_addr(), b.p2p_addr());
 
     // B dials A; both have -v2transport=1, so the outbound connection should be v2.
@@ -76,8 +76,8 @@ fn two_nodes_connect_over_v2() {
 #[ignore = "requires the patched bitcoind build; run with --ignored"]
 fn decoy_round_trip_over_v2() {
     let bin = patched_bitcoind();
-    let a = RegtestNode::start_with_binary(&bin).expect("patched node A");
-    let b = RegtestNode::start_with_binary(&bin).expect("patched node B");
+    let a = Node::regtest_with_binary(&bin).expect("patched node A");
+    let b = Node::regtest_with_binary(&bin).expect("patched node B");
     b.connect_to(&a).expect("addnode");
     assert!(b.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "B↔A on v2");
     assert!(a.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "A sees v2 peer");
@@ -107,10 +107,10 @@ fn decoy_round_trip_over_v2() {
 }
 
 /// Peer two patched nodes and hand each side a `Bip324Transport`.
-fn peered_transports() -> (RegtestNode, RegtestNode, Bip324Transport, Bip324Transport) {
+fn peered_transports() -> (Node, Node, Bip324Transport, Bip324Transport) {
     let bin = patched_bitcoind();
-    let a = RegtestNode::start_with_binary(&bin).expect("patched node A");
-    let b = RegtestNode::start_with_binary(&bin).expect("patched node B");
+    let a = Node::regtest_with_binary(&bin).expect("patched node A");
+    let b = Node::regtest_with_binary(&bin).expect("patched node B");
     b.connect_to(&a).expect("addnode");
     assert!(b.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "B↔A on v2");
     assert!(a.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "A sees v2 peer");

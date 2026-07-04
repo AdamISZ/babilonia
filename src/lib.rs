@@ -23,6 +23,11 @@
 //! **message flow** (`setup`/`messages` still run the pre-v5 handshake). L1 BIP324 covert transport
 //! is wired (`transport::bip324`, `node` feature). The `proofs` module's `AssumeValid` is vestigial.
 
+/// The game — business logic only (roles, outcome, the bet sequence); no bitcoin.
+pub mod game;
+/// The node layer — translates game verbs into bitcoin transactions (requires the `node` feature).
+#[cfg(feature = "node")]
+pub mod bet;
 pub mod keys;
 pub mod messages;
 pub mod musig;
@@ -30,9 +35,10 @@ pub mod params;
 pub mod proofs;
 pub mod protocol;
 pub mod setup;
-/// Regtest harness driving a local `bitcoind` over RPC (requires the `node` feature).
+/// A party's local Bitcoin node — RPC/wallet, network, p2p, and the BIP324 transport (requires
+/// the `node` feature). The infra the node layer builds bet transactions on.
 #[cfg(feature = "node")]
-pub mod regtest;
+pub mod node;
 pub mod reveal;
 pub mod sigma;
 pub mod transport;

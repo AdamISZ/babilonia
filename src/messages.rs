@@ -15,6 +15,8 @@
 //! Encoding: points 33B SEC1, scalars/partials 32B, MuSig2 pub-nonces 66B, variable bytes `u32`-LE
 //! length-prefixed, each message a 1-byte tag; a bounds-checked reader rejects short/trailing.
 
+use bitcoin::hashes::Hash;
+use bitcoin::{OutPoint, Txid};
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use musig2::{BinaryEncoding, PartialSignature, PubNonce};
 
@@ -24,6 +26,39 @@ const TAG_ALICE_OPEN: u8 = 1;
 const TAG_BOB_COMMIT: u8 = 2;
 const TAG_ALICE_REVEAL: u8 = 3;
 const TAG_BOB_AUTH: u8 = 4;
+const TAG_FUND_OPEN: u8 = 5;
+const TAG_FUND_REPLY: u8 = 6;
+const TAG_FUND_FINAL: u8 = 7;
+
+// --- joint PSBT funding sub-protocol (before the setup driver; v5 §P1) ---
+
+/// Funding flight 1 — Dealer → Player. The dealer's funding key, the input it contributes, and its
+/// change address. From this the player can build the shared funding PSBT.
+#[derive(Clone, Debug)]
+pub struct FundOpen {
+    pub p_a: Point,
+    pub input: OutPoint,
+    pub amount: u64,
+    pub change: String,
+}
+
+/// Funding flight 2 — Player → Dealer. The player's contribution plus its wallet-signed PSBT (its
+/// own input signed).
+#[derive(Clone, Debug)]
+pub struct FundReply {
+    pub p_b: Point,
+    pub input: OutPoint,
+    pub amount: u64,
+    pub change: String,
+    pub psbt: String,
+}
+
+/// Funding flight 3 — Dealer → Player. The dealer's wallet-signed PSBT, so the player can combine +
+/// finalize the same `TX1`.
+#[derive(Clone, Debug)]
+pub struct FundFinal {
+    pub psbt: String,
+}
 
 /// Flight 1 (P2) — Alice → Bob. Her funding key `P_a` and thimbles `A_1,A_2 = a_1·G, a_2·G` with
 /// PoKs.
@@ -85,6 +120,10 @@ fn put_lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
 }
+fn put_outpoint(out: &mut Vec<u8>, o: &OutPoint) {
+    out.extend_from_slice(&o.txid.to_byte_array());
+    out.extend_from_slice(&o.vout.to_le_bytes());
+}
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -125,6 +164,17 @@ impl<'a> Reader<'a> {
     fn lp(&mut self) -> Result<Vec<u8>> {
         let n = u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize;
         Ok(self.take(n)?.to_vec())
+    }
+    fn string(&mut self) -> Result<String> {
+        String::from_utf8(self.lp()?).map_err(|_| Error::Decode("invalid utf-8"))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn outpoint(&mut self) -> Result<OutPoint> {
+        let txid = Txid::from_byte_array(self.take(32)?.try_into().unwrap());
+        let vout = u32::from_le_bytes(self.take(4)?.try_into().unwrap());
+        Ok(OutPoint { txid, vout })
     }
     fn finish(self) -> Result<()> {
         if self.pos == self.buf.len() {
@@ -223,6 +273,64 @@ impl BobAuth {
         let mut r = Reader::new(buf);
         r.tag(TAG_BOB_AUTH)?;
         let m = BobAuth { refund_partial: r.partial()?, settle_partial: r.partial()? };
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FundOpen {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TAG_FUND_OPEN];
+        put_point(&mut out, &self.p_a);
+        put_outpoint(&mut out, &self.input);
+        out.extend_from_slice(&self.amount.to_le_bytes());
+        put_lp(&mut out, self.change.as_bytes());
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_FUND_OPEN)?;
+        let m = FundOpen { p_a: r.point()?, input: r.outpoint()?, amount: r.u64()?, change: r.string()? };
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FundReply {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TAG_FUND_REPLY];
+        put_point(&mut out, &self.p_b);
+        put_outpoint(&mut out, &self.input);
+        out.extend_from_slice(&self.amount.to_le_bytes());
+        put_lp(&mut out, self.change.as_bytes());
+        put_lp(&mut out, self.psbt.as_bytes());
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_FUND_REPLY)?;
+        let m = FundReply {
+            p_b: r.point()?,
+            input: r.outpoint()?,
+            amount: r.u64()?,
+            change: r.string()?,
+            psbt: r.string()?,
+        };
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl FundFinal {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TAG_FUND_FINAL];
+        put_lp(&mut out, self.psbt.as_bytes());
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_FUND_FINAL)?;
+        let m = FundFinal { psbt: r.string()? };
         r.finish()?;
         Ok(m)
     }
