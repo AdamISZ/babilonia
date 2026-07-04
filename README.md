@@ -10,13 +10,54 @@
 
 > **Research code.** This is a working scaffold for a thesis, not audited software. Security proofs not yet done, though there isn't a likely concern one can never be too cautious! See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
-## How the game works (v5)
+## How the game works
 
 Alice (the **dealer**) picks a secret choice `c` from 1,2, encoded in a list of points `A_1, A_2`; Bob (the **player**) picks a secret guess `y` and
 **wins iff `y = c`**. The roles are symmetrical but there is no trust. One jointly-funded taproot output `U1` (the pot) is spent by a MuSig2
 **adaptor signature locked to `D = d·G`** for a fresh dealer secret `d`. Both sides get ZKPs that guarantee the other behaves honestly. Alice can't be paid without
 completing that adaptor — which *posts `d` on-chain*. Bob then decrypts the outcome
 `a_c = ctxt − H(d)` (from `ctxt = a_c + H(d)`) and, if he won, claims the pot via the taproot address which he only knows the secret key for because of that decryption; otherwise Alice reclaims it after a timeout. There is also a refund Tx if the payout Tx never gets broadcast.
+
+### The transactions
+
+The pot lives in one jointly-funded taproot output `U1`. From there, two transactions carry the
+outcome: the **settlement** spends `U1` and, by completing the adaptor, publishes `d`; the
+**claim** then spends the settlement's output — Bob's honest win is a plain **key-path** spend
+(indistinguishable from an ordinary payment), and only if a *losing* Bob griefs does Alice fall
+back to a timelock **script leaf**. A **refund** is the fallback if the settlement is never
+broadcast. (A future cooperative overlay would make even the loss path a plain key-path payment —
+see the TODO in `docs/DESIGN.md`.)
+
+```
+   U1  — the pot: one jointly-funded P2TR output (key-path MuSig2(P_a, P_b))
+    │
+    ├─►  REFUND — spends U1 at nLockTime t_r, returning the stakes;
+    │            the fallback if the settlement is never broadcast
+    ▼
+   ┌──────────────────────────────────────────────┐
+   │ SETTLEMENT   (spends U1)                     │
+   │                                              │
+   │ wit: one MuSig2 Schnorr sig — the D = d·G    │
+   │      adaptor completed with d, so            │
+   │      broadcasting it publishes d on-chain    │
+   │ out: the claim output  ↓                     │
+   └──────────────────────────────────────────────┘
+                          │
+                          ▼
+   the claim output — P2TR with internal key K; one script leaf (Alice timeout)
+                    ┌───────────────────┴────────────────────┐
+                    ▼                                        ▼
+ ┌────────────────────────────────────┐   ┌────────────────────────────────────┐
+ │ CLAIM — Bob wins (y = c)           │   │ CLAIM — Alice, after timeout       │
+ │ KEY-PATH spend of K  (no script!)  │   │ leaf: <t_1> OP_CSV OP_DROP         │
+ │ K = W_b + A_y; Bob knows dlog K    │   │       <P_a> OP_CHECKSIG            │
+ │ = w_b + a_c once a_c is revealed   │   │ spendable after t_1 blocks;        │
+ │ out: pot → Bob                     │   │ Bob lost / never claimed           │
+ │                                    │   │ out: pot → Alice                   │
+ └────────────────────────────────────┘   └────────────────────────────────────┘
+```
+
+STILL TO DO: Cooperative Alice wins case: we don't want to broadcast the script path spend on the OP_CSV condition, which is not a standard payment; but if Bob cooperates they can use an overlay spend instead, and since Bob probably prefers that, he will likely do it. Trivial to implement, just not done yet.
 
 ### Architecture
 
@@ -78,7 +119,7 @@ funded two wallets (alice, bob); U1 will be jointly funded during play
   [dealer] running the 4-flight setup …
   [dealer] settled — adapted with d and broadcast c930e1… (d now on-chain)
   [player] extracted d, decrypted a_c → PlayerWins
-  [player] spent the pot via the <K> leaf — broadcast 18a72a…
+  [player] spent the pot via the <K> key path — broadcast 18a72a…
 🎉 PLAYER won and claimed the pot.
 ```
 

@@ -2,8 +2,9 @@
 //! End-to-end regtest tests for the **v5** transaction graph. One jointly-funded output `U1`; the
 //! settlement spends it with a MuSig2 **adaptor signature locked to `D = d·G`** whose completion
 //! posts `d` on-chain. Bob extracts `d`, decrypts `a_c = ctxt − H(d)`, and — if he won — spends the
-//! claim output via its `<K>` leaf. Also the fallbacks: refund (`nLockTime t_r`) and Alice's
-//! timeout leaf. The hash conjunct binding `ctxt` to `a_c` is the ZKP layer; here `ctxt` is honest
+//! claim output via a **key-path** spend under `K` (its internal key). Also the fallbacks: refund
+//! (`nLockTime t_r`) and Alice's timeout leaf. The hash conjunct binding `ctxt` to `a_c` is the ZKP
+//! layer; here `ctxt` is honest
 //! and we validate the on-chain graph + reveal against a real `bitcoind`.
 //!
 //! Requires `bitcoind` on PATH. Ignored by default. Run:
@@ -18,6 +19,7 @@ use babilonia::txgraph::{
     build_claim_spend, build_refund, build_settlement, key_spend_sighash, script_spend_sighash,
     ClaimOutput, TaprootKey,
 };
+use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair as BKeypair, Message, SecretKey};
 use bitcoin::{absolute::LockTime, Address, Amount, Network, OutPoint, Sequence, TxOut, Witness};
 use bitcoincore_rpc::RpcApi;
@@ -84,7 +86,8 @@ fn adaptor_settle(
 }
 
 /// Capstone: the settlement confirms (adaptor on `D`, posting `d`); Bob extracts `d`, decrypts
-/// `a_c`, and spends the claim output via `<K>` — the full Bob-wins settlement on real `bitcoind`.
+/// `a_c`, and spends the claim output via a **key-path** spend under `K` — the full Bob-wins
+/// settlement on real `bitcoind`.
 #[test]
 #[ignore = "requires bitcoind on PATH; run with --ignored"]
 fn settle_then_bob_claims_on_regtest() {
@@ -121,7 +124,7 @@ fn settle_then_bob_claims_on_regtest() {
     assert_eq!(a_c_bob, a_c, "Bob decrypts a_c = ctxt − H(d)");
     assert!(won(&a_c_bob, &a_c.base_point_mul()));
 
-    // Bob claims the pot via the <K> leaf.
+    // Bob claims the pot via a KEY-PATH spend under K (internal key) — no script revealed.
     let claim_out = OutPoint { txid: settle_txid, vout: 0 };
     let dest = f.node.new_address().unwrap();
     let mut claim_tx = build_claim_spend(
@@ -129,18 +132,17 @@ fn settle_then_bob_claims_on_regtest() {
         Sequence::default(),
         vec![TxOut { value: pot - fee, script_pubkey: dest.script_pubkey() }],
     );
-    let csh = script_spend_sighash(&claim_tx, 0, &[claim.txout(pot)], &claim.bob_leaf).unwrap();
+    let csh = key_spend_sighash(&claim_tx, 0, &[claim.txout(pot)]).unwrap();
     let bsecp = bitcoin::secp256k1::Secp256k1::new();
     let kp = BKeypair::from_secret_key(&bsecp, &SecretKey::from_slice(&claim_sk.serialize()).unwrap());
-    let leaf_sig = bsecp.sign_schnorr_no_aux_rand(&Message::from_digest(csh), &kp).serialize();
-    let cb = claim.control_block(&claim.bob_leaf).unwrap();
-    claim_tx.input[0].witness =
-        Witness::from_slice(&[leaf_sig.as_slice(), claim.bob_leaf.as_bytes(), &cb.serialize()]);
+    let tweaked = kp.tap_tweak(&bsecp, claim.spend_info.merkle_root());
+    let key_sig = bsecp.sign_schnorr_no_aux_rand(&Message::from_digest(csh), &tweaked.to_keypair()).serialize();
+    claim_tx.input[0].witness = Witness::from_slice(&[key_sig.as_slice()]);
 
-    let claim_txid = f.node.broadcast(&claim_tx).expect("bitcoind accepts Bob's <K>-leaf claim");
+    let claim_txid = f.node.broadcast(&claim_tx).expect("bitcoind accepts Bob's key-path claim under K");
     f.node.mine(1).unwrap();
     assert!(f.node.utxo_confirmations(&OutPoint { txid: claim_txid, vout: 0 }).unwrap().is_some());
-    println!("[claim]  Bob decrypted a_c and spent the pot via K ✓  ({claim_txid})");
+    println!("[claim]  Bob decrypted a_c and spent the pot via K (key path) ✓  ({claim_txid})");
 }
 
 /// Alice's timeout leaf: rejected before the relative timelock, accepted after.

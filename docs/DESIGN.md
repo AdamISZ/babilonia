@@ -7,7 +7,9 @@
 > MuSig2 **adaptor locked to `D = d·G`** for a fresh, outcome-independent dealer secret `d`. Alice
 > can't be paid without completing it (which posts `d`); Bob then decrypts `a_c = ctxt − H(d)`
 > (`ctxt = a_c + H(d)`, RO pad — a linear pad leaks `c`) and, if he won (`a_c·G = A_y`), claims
-> `K = W_b + A_y`. `π_a` = a **Σ-part** (a committed `a_c` is one published thimble — built) + **one
+> `K = W_b + A_y` by a **key-path** spend (`K` is the claim output's internal key — the honest win is
+> an ordinary taproot payment; the sole script is Alice's `t_1` timeout leaf, hit only when a losing
+> Bob griefs). `π_a` = a **Σ-part** (a committed `a_c` is one published thimble — built) + **one
 > hash circuit** (binds `ctxt` to `a_c`; Bulletproofs vs cut-and-choose TBD). Thimbles are now
 > `A_i = a_i·G` (freeing `H` for the hash). **Built + regtest-validated (2026-07-04) — the whole v5
 > stack:** `txgraph` (single-output graph), `reveal` (`d`→`a_c`), `sigma` (`π_a` Σ-part / `π_r` /
@@ -16,6 +18,18 @@
 > playable single-process (`regtest-game` bin) and **across two nodes over the real BIP324 covert
 > channel** (`party` bin). **Only pending:** the `π_a` hash circuit (Bulletproofs vs cut-and-choose).
 > Treat single-adaptor / two-output passages below (and `H_i`/`h_c` notation) as stale.
+
+> **TODO — cooperative overlay (not yet built).** The payout today reveals a script *only* in the
+> adversarial branch: Alice's `t_1` timeout leaf, hit when a **losing Bob griefs**. Bob's honest win
+> is already a key-path spend, and the refund/timeout backstops make the bet fully trustless as-is.
+> A future **cooperative overlay** removes even that residual leak from the honest path: once the
+> outcome is settled (Alice hands `d` to Bob off-chain, verifiable against `D`), the two parties
+> co-sign a plain **key-path** spend of `U1` straight to the **winner's** fresh destination — no
+> settlement, no claim output, no script, for *either* outcome (both control the 2-of-2 `U1`). The
+> loser has no incentive to refuse: refusal only costs the winner a delay and, in the losing-Bob
+> case, the one script reveal, since the existing on-chain settlement→claim backstop still pays out.
+> That cooperative spend *is* also the mix (fresh destination breaks linkage). Deferred as another
+> chunk of interaction; the current trustless bet works without it.
 
 > Status: early architecture. This is a living spine to mark up, not a spec.
 > Tags used below: **[DECIDED]** settled direction · **[FOCUS]** current build target ·

@@ -3,8 +3,10 @@
 > **⚠ SUPERSEDED BY v5 (2026-07-04).** The single-adaptor reveal described below does **not**
 > achieve atomic settlement (see `adaptor_construction_spec_v5.tex` §1). The real construction: one
 > output `U1` (pot), whose settlement is a MuSig2 **adaptor locked to `D = d·G`** (completing it
-> posts the fresh dealer secret `d`); `RefundTx` at `t_r`; the winner `K = W_b + A_y` claims via a
-> taproot `<K>` leaf, Alice reclaims via a `t_1` timeout leaf. The outcome is a hash-padded
+> posts the fresh dealer secret `d`); `RefundTx` at `t_r`; the winner `K = W_b + A_y` claims by a
+> **key-path** spend (`K` is the claim output's taproot internal key — Bob knows `dlog K = w_b + a_c`
+> once he's won), so the honest win is indistinguishable from a normal payment; the *only* script is a
+> single `t_1` timeout leaf for Alice to reclaim if a losing Bob griefs. The outcome is a hash-padded
 > ciphertext `ctxt = a_c + H(d)` (thimbles `A_i = a_i·G`); Bob extracts `d`, gets `a_c = ctxt − H(d)`.
 > `π_a` = Σ-part (built) + one hash circuit (the **only** stubbed piece). **Implemented + regtest-
 > validated to v5:** `txgraph`, `reveal`, `sigma`, the **four-flight message layer** (`messages`/

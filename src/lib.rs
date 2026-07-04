@@ -8,7 +8,7 @@
 //! ```text
 //! TX1 ─► U1 (pot, MuSig2(P_a,P_b)) ─┬─ RefundTx  (spends U1; nLockTime t_r)   [fallback]
 //!                                   └─ SettleTx  (spends U1; adaptor on D=d·G → POSTS d)
-//!        ─► ClaimOutput = P2TR(NUMS): leaf <K> CHECKSIG (Bob-wins) | <t_1> CSV <P_a> (Alice)
+//!        ─► ClaimOutput = P2TR(internal K): Bob-wins = key-path spend of K; one leaf <t_1> CSV <P_a>
 //! ```
 //!
 //! **Interlock:** Alice cannot spend `U1` (get the pot) without completing the settlement adaptor,

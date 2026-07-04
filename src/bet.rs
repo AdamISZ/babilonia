@@ -9,6 +9,7 @@
 
 use std::time::{Duration, Instant};
 
+use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair as BKeypair, Message, SecretKey};
 use bitcoin::{Address, Amount, Network, OutPoint, Sequence, Transaction, TxOut, Txid, Witness, XOnlyPublicKey};
 use bitcoincore_rpc::{Client, RpcApi};
@@ -21,7 +22,7 @@ use crate::musig::{adapt, extract, signature_bytes};
 use crate::reveal::{claim_secret, recover_a_c, won};
 use crate::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams, SetupResult};
 use crate::transport::Transport;
-use crate::txgraph::{build_claim_spend, script_spend_sighash, ClaimOutput, TaprootKey};
+use crate::txgraph::{build_claim_spend, key_spend_sighash, script_spend_sighash, ClaimOutput, TaprootKey};
 use crate::{Error, Result};
 
 /// Total funding-transaction fee (split evenly between the two contributors).
@@ -258,29 +259,25 @@ impl<T: Transport> Bet<T> {
         }
     }
 
-    /// Spend the claim output via one of its leaves, signing with `key_secret` under `leaf`.
-    fn spend_claim_leaf(&self, key_secret: &Scalar, leaf_is_alice: bool, sequence: Sequence) -> Result<()> {
+    /// Build the unsigned claim-output spend paying the pot (minus fee) to a fresh wallet address.
+    fn build_claim_spend_tx(&self, sequence: Sequence) -> Result<(Transaction, Amount, ClaimOutput)> {
         let claim = self.claim_output()?;
-        let leaf = if leaf_is_alice { &claim.alice_leaf } else { &claim.bob_leaf };
         let pot = self.pot()?;
         let claim_out = OutPoint { txid: self.settle_txid()?, vout: 0 };
         let dest = self.new_address()?;
         let out_value = pot.checked_sub(self.params.fee).ok_or(Error::Protocol("fee exceeds claim"))?;
-        let mut tx = build_claim_spend(
+        let tx = build_claim_spend(
             claim_out,
             sequence,
             vec![TxOut { value: out_value, script_pubkey: dest.script_pubkey() }],
         );
-        let sighash = script_spend_sighash(&tx, 0, &[claim.txout(pot)], leaf)?;
-        let bsecp = bitcoin::secp256k1::Secp256k1::new();
-        let sk = SecretKey::from_slice(&key_secret.serialize()).map_err(|_| Error::Protocol("bad claim key"))?;
-        let kp = BKeypair::from_secret_key(&bsecp, &sk);
-        let sig = bsecp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &kp).serialize();
-        let cb = claim.control_block(leaf)?;
-        tx.input[0].witness = Witness::from_slice(&[sig.as_slice(), leaf.as_bytes(), &cb.serialize()]);
-        let via = if leaf_is_alice { "Alice-timeout leaf" } else { "<K> leaf" };
-        self.log(&self.decode_tx(&tx, &format!("claim spend (script path: {via})")));
-        let txid = self.client.send_raw_transaction(&tx)?;
+        Ok((tx, pot, claim))
+    }
+
+    /// Broadcast a fully-witnessed claim spend, wait for confirmation, and log it.
+    fn submit_claim(&self, tx: &Transaction, label: &str, via: &str) -> Result<()> {
+        self.log(&self.decode_tx(tx, label));
+        let txid = self.client.send_raw_transaction(tx)?;
         self.wait_confirmed(txid, 1)?;
         self.log(&format!("spent the pot via the {via} — broadcast {txid}"));
         Ok(())
@@ -425,7 +422,16 @@ impl<T: Transport> BetChain for Bet<T> {
             BetRole::Dealer(_) => return Err(Error::Protocol("only the player claims a win")),
         };
         let claim_sk = claim_secret(&w_b, &a_c)?; // dlog K = w_b + a_c
-        self.spend_claim_leaf(&claim_sk, false, Sequence::default())
+        let (mut tx, pot, claim) = self.build_claim_spend_tx(Sequence::default())?;
+        // Key-path spend of the claim output (internal key K) — no script revealed, indistinguishable
+        // from an ordinary taproot payment.
+        let sighash = key_spend_sighash(&tx, 0, &[claim.txout(pot)])?;
+        let bsecp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = SecretKey::from_slice(&claim_sk.serialize()).map_err(|_| Error::Protocol("bad claim key"))?;
+        let tweaked = BKeypair::from_secret_key(&bsecp, &sk).tap_tweak(&bsecp, claim.spend_info.merkle_root());
+        let sig = bsecp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &tweaked.to_keypair()).serialize();
+        tx.input[0].witness = Witness::from_slice(&[sig.as_slice()]);
+        self.submit_claim(&tx, "claim (Bob wins — key-path spend of K)", "<K> key path")
     }
 
     fn dealer_take_on_loss(&mut self) -> Result<()> {
@@ -436,7 +442,17 @@ impl<T: Transport> BetChain for Bet<T> {
         // Wait for the relative timelock to mature: the claim output (created by the settlement)
         // needs `alice_timeout` confirmations before its CSV leaf is spendable.
         self.wait_confirmed(self.settle_txid()?, self.params.alice_timeout as u32)?;
-        self.spend_claim_leaf(&sk_a, true, Sequence::from_height(self.params.alice_timeout))
+        let (mut tx, pot, claim) = self.build_claim_spend_tx(Sequence::from_height(self.params.alice_timeout))?;
+        // Script-path spend of Alice's timeout leaf — the only script that ever hits the chain.
+        let sighash = script_spend_sighash(&tx, 0, &[claim.txout(pot)], &claim.alice_leaf)?;
+        let bsecp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = SecretKey::from_slice(&sk_a.serialize()).map_err(|_| Error::Protocol("bad key"))?;
+        let sig = bsecp
+            .sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &BKeypair::from_secret_key(&bsecp, &sk))
+            .serialize();
+        let cb = claim.control_block(&claim.alice_leaf)?;
+        tx.input[0].witness = Witness::from_slice(&[sig.as_slice(), claim.alice_leaf.as_bytes(), &cb.serialize()]);
+        self.submit_claim(&tx, "claim (Alice timeout — script-path spend)", "Alice-timeout leaf")
     }
 }
 

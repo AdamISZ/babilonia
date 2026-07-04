@@ -5,10 +5,14 @@
 //! TX1 ─► U1 (pot, MuSig2(P_a,P_b) key-path) ─┬─ RefundTx  (spends U1; nLockTime t_r)   [fallback]
 //!                                            └─ SettleTx  (spends U1; adaptor on D=d·G,
 //!                                                          completing it POSTS d)  ─► ClaimOutput
-//!   ClaimOutput = P2TR(NUMS internal) with two leaves:
-//!     bob_wins     : <K> OP_CHECKSIG                     (winner knows dlog K = w_b + a_c)
-//!     alice_timeout: <t_1> OP_CSV OP_DROP <P_a> OP_CHECKSIG   (Alice reclaims after t_1)
+//!   ClaimOutput = P2TR(internal key = K):
+//!     bob_wins     : **key-path** spend of K   (winner knows dlog K = w_b + a_c) — no script revealed
+//!     alice_timeout: one leaf <t_1> OP_CSV OP_DROP <P_a> OP_CHECKSIG   (Alice reclaims after t_1)
 //! ```
+//! Bob's honest win is thus indistinguishable from an ordinary taproot payment; the only script that
+//! can hit the chain is Alice's timeout leaf, and only when a losing Bob griefs. A *cooperative
+//! overlay* (spend `U1` straight to the winner, no settlement/scripts at all) is a future TODO —
+//! see `docs/DESIGN.md`.
 //!
 //! **Interlock** (v5 §P6): Alice cannot spend `U1` (get the pot) without completing the settlement
 //! adaptor, which posts `d`; Bob then decrypts `a_c = ctxt − H(d)` and, if he won, claims `K`.
@@ -55,17 +59,6 @@ impl TaprootKey {
     }
 }
 
-/// BIP341's "nothing-up-my-sleeve" x-only point — the unspendable internal key for the claim
-/// output, so the pot can only move through the two named leaves.
-const NUMS_INTERNAL: [u8; 32] = [
-    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
-    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
-];
-
-fn nums_internal() -> XOnlyPublicKey {
-    XOnlyPublicKey::from_slice(&NUMS_INTERNAL).expect("valid BIP341 NUMS point")
-}
-
 /// An unsigned N-input spend (witnesses filled after signing).
 fn spend_inputs(inputs: &[(OutPoint, Sequence)], outputs: Vec<TxOut>, lock_time: LockTime) -> Transaction {
     Transaction {
@@ -97,26 +90,22 @@ pub fn build_settlement(u1: OutPoint, outputs: Vec<TxOut>) -> Transaction {
     spend_inputs(&[(u1, Sequence::ENABLE_RBF_NO_LOCKTIME)], outputs, LockTime::ZERO)
 }
 
-/// The pot payout output: P2TR with an unspendable NUMS internal key and two leaves — Bob-wins
-/// (`<K> OP_CHECKSIG`, spendable only by the winner who knows `dlog K = w_b + a_c`) and
-/// Alice-timeout (`<t_1> OP_CSV OP_DROP <P_a> OP_CHECKSIG`).
+/// The pot payout output: P2TR with **internal key `K`** — so the winner, who knows
+/// `dlog K = w_b + a_c`, spends via a clean **key path** (indistinguishable from a normal taproot
+/// payment) — and a single script leaf, Alice-timeout (`<t_1> OP_CSV OP_DROP <P_a> OP_CHECKSIG`),
+/// as the grief-only fallback for a losing Bob who refuses to cooperate.
 pub struct ClaimOutput {
     pub spk: ScriptBuf,
     pub spend_info: TaprootSpendInfo,
-    pub bob_leaf: ScriptBuf,
     pub alice_leaf: ScriptBuf,
 }
 
 impl ClaimOutput {
-    /// Build the claim output for pot-claim key `K`, Alice's fallback key, and relative timelock
-    /// `alice_timeout` (blocks, BIP68).
+    /// Build the claim output for pot-claim key `K` (the taproot internal key), Alice's fallback
+    /// key, and relative timelock `alice_timeout` (blocks, BIP68).
     pub fn new(k: Point, alice_key: XOnlyPublicKey, alice_timeout: u16) -> Result<Self> {
         let k_xonly = XOnlyPublicKey::from_slice(&k.serialize()[1..33])
             .map_err(|_| Error::Protocol("claim key K is not a valid x-only point"))?;
-        let bob_leaf = Builder::new()
-            .push_x_only_key(&k_xonly)
-            .push_opcode(OP_CHECKSIG)
-            .into_script();
         let alice_leaf = Builder::new()
             .push_int(alice_timeout as i64)
             .push_opcode(OP_CSV)
@@ -126,13 +115,12 @@ impl ClaimOutput {
             .into_script();
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         let spend_info = TaprootBuilder::new()
-            .add_leaf(1, bob_leaf.clone())
-            .and_then(|b| b.add_leaf(1, alice_leaf.clone()))
+            .add_leaf(0, alice_leaf.clone())
             .map_err(|_| Error::Protocol("taproot builder: add leaf"))?
-            .finalize(&secp, nums_internal())
-            .map_err(|_| Error::Protocol("taproot builder: finalize"))?;
+            .finalize(&secp, k_xonly)
+            .map_err(|_| Error::Protocol("taproot builder: finalize (internal key K)"))?;
         let spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
-        Ok(ClaimOutput { spk, spend_info, bob_leaf, alice_leaf })
+        Ok(ClaimOutput { spk, spend_info, alice_leaf })
     }
 
     /// A `TxOut` paying `value` into the claim output.
@@ -264,10 +252,11 @@ mod tests {
         assert_eq!(extract(&pre, &sig).unwrap().unwrap(), d, "settlement reveals d");
     }
 
-    /// The winner (who knows `dlog K = w_b + a_c`) can produce a valid BIP340 signature under the
-    /// Bob-wins leaf key `K`.
+    /// The winner (who knows `dlog K = w_b + a_c`) can produce a valid taproot **key-path**
+    /// signature under the output key (K tweaked by the timeout-leaf tree) — no script revealed.
     #[test]
-    fn claim_bob_wins_leaf_signs() {
+    fn claim_bob_wins_keypath_signs() {
+        use bitcoin::key::TapTweak;
         use bitcoin::secp256k1::{Keypair as BKeypair, Message, Secp256k1, SecretKey};
         let secp = secp256k1::Secp256k1::new();
         let a = Keypair::new(&secp);
@@ -286,16 +275,15 @@ mod tests {
             Sequence::default(),
             vec![TxOut { value: Amount::from_sat(149_000), script_pubkey: claim.spk.clone() }],
         );
-        let sighash = script_spend_sighash(&tx, 0, &[claim_prevout], &claim.bob_leaf).unwrap();
+        let sighash = key_spend_sighash(&tx, 0, &[claim_prevout]).unwrap();
 
         let bsecp = Secp256k1::new();
         let kp = BKeypair::from_secret_key(&bsecp, &SecretKey::from_slice(&claim_sk.serialize()).unwrap());
-        let sig = bsecp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &kp);
-        let k_xonly = XOnlyPublicKey::from_slice(&k.serialize()[1..33]).unwrap();
+        let tweaked = kp.tap_tweak(&bsecp, claim.spend_info.merkle_root());
+        let sig = bsecp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &tweaked.to_keypair());
         bsecp
-            .verify_schnorr(&sig, &Message::from_digest(sighash), &k_xonly)
-            .expect("winner's bob-leaf signature is a valid BIP340 sig under K");
-        assert!(claim.control_block(&claim.bob_leaf).is_ok());
+            .verify_schnorr(&sig, &Message::from_digest(sighash), &claim.spend_info.output_key().to_x_only_public_key())
+            .expect("winner's key-path signature is valid under the tweaked output key K");
     }
 
     /// Alice's timeout leaf: the spend must carry the relative-timelock sequence, and she signs a
