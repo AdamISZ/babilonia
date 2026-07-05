@@ -110,7 +110,7 @@ fn run_dealer(node: Node) -> Result<(), Box<dyn Error>> {
         choice: 1,
         d: Scalar::from(Keypair::new(&secp).sk),
     };
-    let mut dealer = Bet::new(node.wallet_client()?, Network::Regtest, transport, params(), BetRole::Dealer(alice))
+    let mut dealer = Bet::new(node.rpc_wallet(node.wallet_client()?), node.rpc_chain()?, Network::Regtest, transport, params(), BetRole::Dealer(alice))
         .with_progress(|m| println!("  [dealer] {m}"));
 
     println!("── playing over BIP324 ─────────────────────────────────");
@@ -143,7 +143,7 @@ fn run_player(node: Node, connect: String, guess: usize) -> Result<(), Box<dyn E
 
     let secp = Secp256k1::new();
     let bob = BobSecrets { funding: Keypair::new(&secp), claim: Keypair::new(&secp), guess };
-    let mut player = Bet::new(node.wallet_client()?, Network::Regtest, transport, params(), BetRole::Player(bob))
+    let mut player = Bet::new(node.rpc_wallet(node.wallet_client()?), node.rpc_chain()?, Network::Regtest, transport, params(), BetRole::Player(bob))
         .with_progress(|m| println!("  [player] {m}"));
 
     println!("── playing over BIP324 (guess y={guess}) ────────────────");

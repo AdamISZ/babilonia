@@ -1,21 +1,21 @@
 //! The node layer — **translates game verbs into Bitcoin transactions**. A [`Bet`] implements
-//! [`crate::game::BetChain`] against a `bitcoind` (via an RPC [`Client`]) and a [`Transport`] to
-//! the counterparty. This is the only place in the game path that builds/broadcasts transactions.
+//! [`crate::game::BetChain`] over three swappable traits — a [`Wallet`] (funding), a [`Chain`]
+//! (broadcast/confirmations), and a [`Transport`] to the counterparty — with **no direct RPC**. This
+//! is the only place in the game path that builds/broadcasts transactions.
 //!
-//! v5 pipeline: `fund_pot` (step 2: pre-funded pot; PSBT joint funding is a later step) → `setup`
-//! (the 4-flight driver) → dealer `settle` (adapt with `d`, broadcast — posts `d`) → `observe`
-//! (player extracts `d` from the on-chain settlement and decrypts `a_c`; dealer watches for a claim
-//! vs the timeout) → `claim`/`dealer_take_on_loss`. `π_a` runs Σ-part-only (hash conjunct stubbed).
+//! v5 pipeline: `fund_pot` (joint PSBT) → `setup` (the 4-flight driver) → `broadcast_funding` →
+//! dealer `settle` (adapt with `d`, broadcast — posts `d`) → `observe` (player extracts `d` and
+//! decrypts `a_c`; dealer watches the claim output) → `claim`/`dealer_take_on_loss`.
 
 use std::time::{Duration, Instant};
 
 use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair as BKeypair, Message, SecretKey};
-use bitcoin::{Address, Amount, Network, OutPoint, Sequence, Transaction, TxOut, Txid, Witness, XOnlyPublicKey};
-use bitcoincore_rpc::{Client, RpcApi};
+use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxOut, Txid, Witness, XOnlyPublicKey};
 use musig2::secp::{Point, Scalar};
 use musig2::CompactSignature;
 
+use crate::chain::Chain;
 use crate::game::{BetChain, Outcome};
 use crate::messages::{FundFinal, FundOpen, FundReply};
 use crate::musig::{adapt, extract, signature_bytes};
@@ -23,6 +23,7 @@ use crate::reveal::{claim_secret, recover_a_c, won};
 use crate::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams, SetupResult};
 use crate::transport::Transport;
 use crate::txgraph::{build_claim_spend, key_spend_sighash, script_spend_sighash, ClaimOutput, TaprootKey};
+use crate::wallet::Wallet;
 use crate::{Error, Result};
 
 /// Total funding-transaction fee (split evenly between the two contributors).
@@ -34,10 +35,11 @@ pub enum BetRole {
     Player(BobSecrets),
 }
 
-/// A bet played by one party: its RPC client (on-chain), its transport (to the peer), the agreed
-/// parameters, and accumulated state.
+/// A bet played by one party over a [`Wallet`], a [`Chain`], and a [`Transport`] to the peer, plus
+/// the agreed parameters and accumulated state.
 pub struct Bet<T: Transport> {
-    client: Client,
+    wallet: Box<dyn Wallet>,
+    chain: Box<dyn Chain>,
     network: Network,
     transport: T,
     params: GameParams,
@@ -49,11 +51,18 @@ pub struct Bet<T: Transport> {
 }
 
 impl<T: Transport> Bet<T> {
-    /// Construct a bet for `role` over `client`/`transport`. The pot `params.u1_outpoint` is assumed
-    /// already funded (step 2's simplified funding); joint PSBT funding lands in `fund_pot` later.
-    pub fn new(client: Client, network: Network, transport: T, params: GameParams, role: BetRole) -> Self {
+    /// Construct a bet for `role` over `wallet`/`chain`/`transport`.
+    pub fn new(
+        wallet: Box<dyn Wallet>,
+        chain: Box<dyn Chain>,
+        network: Network,
+        transport: T,
+        params: GameParams,
+        role: BetRole,
+    ) -> Self {
         Bet {
-            client,
+            wallet,
+            chain,
             network,
             transport,
             params,
@@ -82,20 +91,13 @@ impl<T: Transport> Bet<T> {
         self.setup.as_ref().ok_or(Error::Protocol("setup not complete"))
     }
 
-    fn new_address(&self) -> Result<Address> {
-        self.client
-            .get_new_address(None, None)?
-            .require_network(self.network)
-            .map_err(|_| Error::Protocol("address network mismatch"))
-    }
-
-    /// Wait until `txid` has at least `min_conf` confirmations (blocks come from a background miner,
-    /// not from us — so this works whether one node or two peered nodes back the chain).
+    /// Wait until `txid` has at least `min_conf` confirmations. Blocks come from the network (or a
+    /// background miner on regtest), not from us; this polls the [`Chain`] view.
     fn wait_confirmed(&self, txid: Txid, min_conf: u32) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if let Ok(info) = self.client.get_raw_transaction_info(&txid, None) {
-                if info.confirmations.unwrap_or(0) >= min_conf {
+            if let Some(c) = self.chain.confirmations(txid)? {
+                if c >= min_conf {
                     return Ok(());
                 }
             }
@@ -106,19 +108,15 @@ impl<T: Transport> Bet<T> {
         }
     }
 
-    /// The full `decoderawtransaction` JSON decode of a signed transaction, for the progress log.
+    /// A labelled decode of a signed transaction for the progress log (via the [`Chain`]).
     fn decode_tx(&self, tx: &Transaction, label: &str) -> String {
-        let raw = hex::encode(bitcoin::consensus::serialize(tx));
-        match self.client.call::<serde_json::Value>("decoderawtransaction", &[raw.into()]) {
-            Ok(v) => format!("{label} (decoderawtransaction):\n{}", serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())),
-            Err(e) => format!("{label}: <decoderawtransaction failed: {e}>"),
-        }
+        format!("{label} {}", self.chain.decode_tx(tx))
     }
 
     fn poll_tx(&self, txid: Txid, timeout: Duration) -> Result<Transaction> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(tx) = self.client.get_raw_transaction(&txid, None) {
+            if let Some(tx) = self.chain.get_transaction(txid)? {
                 return Ok(tx);
             }
             if Instant::now() > deadline {
@@ -130,20 +128,6 @@ impl<T: Transport> Bet<T> {
 
     // --- joint PSBT funding helpers ---
 
-    /// Pick one confirmed wallet UTXO covering `need`.
-    fn select_input(&self, need: Amount) -> Result<(OutPoint, Amount)> {
-        let utxos = self.client.list_unspent(Some(1), None, None, None, None)?;
-        let u = utxos
-            .into_iter()
-            .find(|u| u.amount >= need)
-            .ok_or(Error::Protocol("no wallet UTXO covers the stake"))?;
-        Ok((OutPoint { txid: u.txid, vout: u.vout }, u.amount))
-    }
-
-    fn change_addr(&self) -> Result<String> {
-        Ok(self.client.call::<String>("getrawchangeaddress", &[])?)
-    }
-
     /// The pot key `U1 = P2TR(MuSig2(P_a,P_b))` and its address string.
     fn u1_taproot(&self, p_a: &secp256k1::PublicKey, p_b: &secp256k1::PublicKey) -> Result<(TaprootKey, String)> {
         let u1 = TaprootKey::new(*p_a, *p_b)?;
@@ -153,7 +137,8 @@ impl<T: Transport> Bet<T> {
     }
 
     /// Build the shared unsigned funding PSBT (both sides build it identically): inputs in order
-    /// `[dealer, player]`, outputs `[U1:pot, dealer_change, player_change]`.
+    /// `[dealer, player]`, outputs `[U1:pot, dealer_change, player_change]`. The output *layout* is
+    /// protocol logic; the PSBT construction goes through the [`Wallet`].
     fn build_funding_psbt(
         &self,
         inputs: [OutPoint; 2],
@@ -161,33 +146,9 @@ impl<T: Transport> Bet<T> {
         pot: Amount,
         changes: [(String, Amount); 2],
     ) -> Result<String> {
-        let ins: Vec<_> = inputs
-            .iter()
-            .map(|o| serde_json::json!({"txid": o.txid.to_string(), "vout": o.vout}))
-            .collect();
         let [(d_addr, d_amt), (p_addr, p_amt)] = changes;
-        let outs = serde_json::json!([
-            {u1_addr: pot.to_btc()},
-            {d_addr: d_amt.to_btc()},
-            {p_addr: p_amt.to_btc()},
-        ]);
-        Ok(self.client.call::<String>("createpsbt", &[serde_json::json!(ins), outs])?)
-    }
-
-    /// Sign our own inputs of a PSBT.
-    fn wallet_sign(&self, psbt: &str) -> Result<String> {
-        Ok(self.client.wallet_process_psbt(psbt, Some(true), None, None)?.psbt)
-    }
-
-    /// Combine the two partially-signed PSBTs and finalise into the raw `TX1`.
-    fn combine_finalize(&self, a: &str, b: &str) -> Result<Transaction> {
-        let combined = self.client.call::<String>("combinepsbt", &[serde_json::json!([a, b])])?;
-        let hex = self
-            .client
-            .finalize_psbt(&combined, Some(true))?
-            .hex
-            .ok_or(Error::Protocol("funding PSBT did not finalise"))?;
-        bitcoin::consensus::deserialize(&hex).map_err(|_| Error::Protocol("bad finalised TX1"))
+        let outputs = [(u1_addr.to_string(), pot), (d_addr, d_amt), (p_addr, p_amt)];
+        self.wallet.create_psbt(&inputs, &outputs)
     }
 
     /// Locate the `U1` output in `TX1` (by scriptPubKey).
@@ -248,8 +209,7 @@ impl<T: Transport> Bet<T> {
         let claim = OutPoint { txid: self.settle_txid()?, vout: 0 };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let unspent = self.client.get_tx_out(&claim.txid, claim.vout, Some(false))?;
-            if unspent.is_none() {
+            if !self.chain.utxo_unspent(claim)? {
                 return Ok(Outcome::PlayerWins); // claim output was spent by the player
             }
             if Instant::now() > deadline {
@@ -264,7 +224,7 @@ impl<T: Transport> Bet<T> {
         let claim = self.claim_output()?;
         let pot = self.pot()?;
         let claim_out = OutPoint { txid: self.settle_txid()?, vout: 0 };
-        let dest = self.new_address()?;
+        let dest = self.wallet.receive_address()?;
         let out_value = pot.checked_sub(self.params.fee).ok_or(Error::Protocol("fee exceeds claim"))?;
         let tx = build_claim_spend(
             claim_out,
@@ -277,7 +237,7 @@ impl<T: Transport> Bet<T> {
     /// Broadcast a fully-witnessed claim spend, wait for confirmation, and log it.
     fn submit_claim(&self, tx: &Transaction, label: &str, via: &str) -> Result<()> {
         self.log(&self.decode_tx(tx, label));
-        let txid = self.client.send_raw_transaction(tx)?;
+        let txid = self.chain.broadcast(tx)?;
         self.wait_confirmed(txid, 1)?;
         self.log(&format!("spent the pot via the {via} — broadcast {txid}"));
         Ok(())
@@ -308,8 +268,8 @@ impl<T: Transport> BetChain for Bet<T> {
 
         let (u1, tx) = match side {
             Side::Dealer => {
-                let (input, amount) = self.select_input(alice_stake + half_fee)?;
-                let change = self.change_addr()?;
+                let (input, amount) = self.wallet.select_input(alice_stake + half_fee)?;
+                let change = self.wallet.change_address()?.to_string();
                 self.transport.send(
                     &FundOpen { p_a: my_key.into(), input, amount: amount.to_sat(), change: change.clone() }.encode(),
                 )?;
@@ -321,27 +281,27 @@ impl<T: Transport> BetChain for Bet<T> {
                     (reply.change, change_of(Amount::from_sat(reply.amount), bob_stake)?),
                 ];
                 let psbt = self.build_funding_psbt([input, reply.input], &u1_addr, pot, changes)?;
-                let mine = self.wallet_sign(&psbt)?;
+                let mine = self.wallet.sign_psbt(&psbt)?;
                 self.transport.send(&FundFinal { psbt: mine.clone() }.encode())?;
-                (u1, self.combine_finalize(&mine, &reply.psbt)?)
+                (u1, self.wallet.combine_finalize(&[&mine, &reply.psbt])?)
             }
             Side::Player => {
                 let open = FundOpen::decode(&self.transport.recv()?)?;
                 let p_a: secp256k1::PublicKey = open.p_a.into();
                 let (u1, u1_addr) = self.u1_taproot(&p_a, &my_key)?;
-                let (input, amount) = self.select_input(bob_stake + half_fee)?;
-                let change = self.change_addr()?;
+                let (input, amount) = self.wallet.select_input(bob_stake + half_fee)?;
+                let change = self.wallet.change_address()?.to_string();
                 let changes = [
                     (open.change, change_of(Amount::from_sat(open.amount), alice_stake)?),
                     (change.clone(), change_of(amount, bob_stake)?),
                 ];
                 let psbt = self.build_funding_psbt([open.input, input], &u1_addr, pot, changes)?;
-                let mine = self.wallet_sign(&psbt)?;
+                let mine = self.wallet.sign_psbt(&psbt)?;
                 self.transport.send(
                     &FundReply { p_b: my_key.into(), input, amount: amount.to_sat(), change, psbt: mine.clone() }.encode(),
                 )?;
                 let fin = FundFinal::decode(&self.transport.recv()?)?;
-                (u1, self.combine_finalize(&mine, &fin.psbt)?)
+                (u1, self.wallet.combine_finalize(&[&mine, &fin.psbt])?)
             }
         };
 
@@ -357,21 +317,10 @@ impl<T: Transport> BetChain for Bet<T> {
     fn broadcast_funding(&mut self) -> Result<()> {
         let tx = self.funding_tx.clone().ok_or(Error::Protocol("no funding tx to broadcast"))?;
         let txid = tx.compute_txid();
-        let _ = self.client.send_raw_transaction(&tx); // ignore "already in mempool/chain"
+        let _ = self.chain.broadcast(&tx); // ignore "already in mempool/chain"
         // Wait for TX1 itself to confirm — NOT for U1 to be unspent, since the dealer's settlement
         // may spend U1 before the other party's check runs.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Ok(info) = self.client.get_raw_transaction_info(&txid, None) {
-                if info.confirmations.unwrap_or(0) >= 1 {
-                    break;
-                }
-            }
-            if Instant::now() > deadline {
-                return Err(Error::Protocol("funding did not confirm"));
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        self.wait_confirmed(txid, 1)?;
         self.log(&format!("funding TX1 broadcast + confirmed ({txid})"));
         Ok(())
     }
@@ -397,7 +346,7 @@ impl<T: Transport> BetChain for Bet<T> {
         let mut tx = s.settle_tx.clone();
         tx.input[0].witness = Witness::from_slice(&[signature_bytes(&sig).as_slice()]);
         self.log(&self.decode_tx(&tx, "settlement (MuSig2 adaptor completed with d)"));
-        let txid = self.client.send_raw_transaction(&tx)?;
+        let txid = self.chain.broadcast(&tx)?;
         self.wait_confirmed(txid, 1)?;
         self.log(&format!("settled — adapted with d and broadcast {txid} (d now on-chain)"));
         Ok(())

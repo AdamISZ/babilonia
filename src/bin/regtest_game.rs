@@ -73,10 +73,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (dch, pch) = channel_pair();
-    let mut dealer = Bet::new(alice_wallet, Network::Regtest, dch, params.clone(), BetRole::Dealer(alice))
-        .with_progress(|m| println!("  [dealer] {m}"));
-    let mut player = Bet::new(bob_wallet, Network::Regtest, pch, params.clone(), BetRole::Player(bob))
-        .with_progress(|m| println!("  [player] {m}"));
+    let mut dealer = Bet::new(
+        node.rpc_wallet(alice_wallet),
+        node.rpc_chain()?,
+        Network::Regtest,
+        dch,
+        params.clone(),
+        BetRole::Dealer(alice),
+    )
+    .with_progress(|m| println!("  [dealer] {m}"));
+    let mut player = Bet::new(
+        node.rpc_wallet(bob_wallet),
+        node.rpc_chain()?,
+        Network::Regtest,
+        pch,
+        params.clone(),
+        BetRole::Player(bob),
+    )
+    .with_progress(|m| println!("  [player] {m}"));
 
     println!("── playing ─────────────────────────────────────────────");
     let ph = std::thread::spawn(move || play_player(&mut player));

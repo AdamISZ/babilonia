@@ -101,6 +101,16 @@ impl Node {
         Ok(wc)
     }
 
+    /// A boxed default [`Wallet`](crate::wallet::Wallet) over `wallet_client` (wallet-scoped RPC).
+    pub fn rpc_wallet(&self, wallet_client: Client) -> Box<dyn crate::wallet::Wallet> {
+        Box::new(crate::wallet::RpcWallet::new(wallet_client, self.network))
+    }
+
+    /// A boxed default [`Chain`](crate::chain::Chain) over a fresh non-wallet RPC client to this node.
+    pub fn rpc_chain(&self) -> Result<Box<dyn crate::chain::Chain>> {
+        Ok(Box::new(crate::chain::RpcChain::new(self.new_rpc_client()?)))
+    }
+
     /// Like [`regtest`](Self::regtest) but with an explicit `bitcoind` path (e.g. a patched build).
     pub fn regtest_with_binary(bitcoind: &str) -> Result<Self> {
         Self::spawn(bitcoind, true)

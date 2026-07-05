@@ -62,8 +62,22 @@ fn full_game_player_wins_on_regtest() {
     };
 
     let (dealer_ch, player_ch) = channel_pair();
-    let mut dealer = Bet::new(alice_wallet, Network::Regtest, dealer_ch, params.clone(), BetRole::Dealer(alice));
-    let mut player = Bet::new(bob_wallet, Network::Regtest, player_ch, params.clone(), BetRole::Player(bob));
+    let mut dealer = Bet::new(
+        node.rpc_wallet(alice_wallet),
+        node.rpc_chain().unwrap(),
+        Network::Regtest,
+        dealer_ch,
+        params.clone(),
+        BetRole::Dealer(alice),
+    );
+    let mut player = Bet::new(
+        node.rpc_wallet(bob_wallet),
+        node.rpc_chain().unwrap(),
+        Network::Regtest,
+        player_ch,
+        params.clone(),
+        BetRole::Player(bob),
+    );
 
     // Bob plays on another thread; both talk only through their transport + the shared chain.
     let player_handle = std::thread::spawn(move || play_player(&mut player));

@@ -29,9 +29,11 @@ pub mod game;
 /// The interface is always compiled; the `pi_a` feature swaps in the real Bulletproofs+Poseidon
 /// hash-circuit implementation (else Σ-part + SHA-256 pad).
 pub mod pi_a;
-/// The node layer — translates game verbs into bitcoin transactions (requires the `node` feature).
-#[cfg(feature = "node")]
+/// The node layer — translates game verbs into bitcoin transactions, over the [`wallet::Wallet`],
+/// [`chain::Chain`] and [`transport::Transport`] traits (no direct RPC).
 pub mod bet;
+/// The `Chain` trait (block/tx view) + the default `RpcChain`. One of the swappable components.
+pub mod chain;
 pub mod keys;
 pub mod messages;
 pub mod musig;
@@ -39,6 +41,8 @@ pub mod params;
 pub mod proofs;
 pub mod protocol;
 pub mod setup;
+/// The `Wallet` trait (funding/addresses/PSBT) + the default `RpcWallet`. Swappable component.
+pub mod wallet;
 /// A party's local Bitcoin node — RPC/wallet, network, p2p, and the BIP324 transport (requires
 /// the `node` feature). The infra the node layer builds bet transactions on.
 #[cfg(feature = "node")]
