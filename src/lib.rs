@@ -29,6 +29,9 @@ pub mod game;
 /// The interface is always compiled; the `pi_a` feature swaps in the real Bulletproofs+Poseidon
 /// hash-circuit implementation (else Σ-part + SHA-256 pad).
 pub mod pi_a;
+/// The node core — a headless, UI-agnostic actor that orchestrates bets over the swappable
+/// `Backend`/`Wallet`/`Chain`/`Transport` traits, driven by `Command`s and emitting `Event`s.
+pub mod agent;
 /// The node layer — translates game verbs into bitcoin transactions, over the [`wallet::Wallet`],
 /// [`chain::Chain`] and [`transport::Transport`] traits (no direct RPC).
 pub mod bet;

@@ -17,6 +17,8 @@ use crate::Result;
 /// The wallet operations the bet layer depends on. Implementors must be `Send` (the node core may
 /// drive them from a worker thread).
 pub trait Wallet: Send {
+    /// Total spendable balance.
+    fn balance(&self) -> Result<Amount>;
     /// A fresh receiving address (for payouts / external funding).
     fn receive_address(&self) -> Result<Address>;
     /// An internal change address.
@@ -65,6 +67,10 @@ mod rpc {
     }
 
     impl Wallet for RpcWallet {
+        fn balance(&self) -> Result<Amount> {
+            Ok(self.client.get_balance(None, None)?)
+        }
+
         fn receive_address(&self) -> Result<Address> {
             self.client
                 .get_new_address(None, None)?

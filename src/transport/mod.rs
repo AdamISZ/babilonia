@@ -35,15 +35,37 @@ use crate::Result;
 /// An ordered, reliable, framed, authenticated bidirectional channel to the peer.
 ///
 /// Object-safe: hold one as `Box<dyn Transport>` to stay agnostic to the medium.
-pub trait Transport {
+pub trait Transport: Send {
     /// Send one framed message to the peer.
     fn send(&mut self, frame: &[u8]) -> Result<()>;
 
     /// Block until the next framed message arrives from the peer, returning it whole.
     fn recv(&mut self) -> Result<Vec<u8>>;
 
+    /// Non-blocking receive: the next frame if one is already available, else `None`. Lets a caller
+    /// poll a transport while also watching other inputs (the node core's peer workers use this to
+    /// select between incoming frames and local instructions).
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>>;
+
     /// Flush any buffered outbound data. Default: no-op (unbuffered transports).
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A `&mut` to any transport is itself a transport (delegation). This lets a bet **session** borrow
+/// a peer worker's owned transport for the duration of a protocol run without moving it out.
+impl<T: Transport + ?Sized> Transport for &mut T {
+    fn send(&mut self, frame: &[u8]) -> Result<()> {
+        (**self).send(frame)
+    }
+    fn recv(&mut self) -> Result<Vec<u8>> {
+        (**self).recv()
+    }
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
+        (**self).try_recv()
+    }
+    fn flush(&mut self) -> Result<()> {
+        (**self).flush()
     }
 }

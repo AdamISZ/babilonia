@@ -95,4 +95,12 @@ impl Transport for Bip324Transport {
             }
         }
     }
+
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
+        if let Some(frame) = self.inbox.pop_front() {
+            return Ok(Some(frame));
+        }
+        self.drain_decoys()?;
+        Ok(self.inbox.pop_front())
+    }
 }

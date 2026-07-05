@@ -35,6 +35,15 @@ impl Transport for DuplexChannel {
             .recv()
             .map_err(|_| Error::Transport("peer channel closed"))
     }
+
+    fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
+        use std::sync::mpsc::TryRecvError;
+        match self.inbound.try_recv() {
+            Ok(v) => Ok(Some(v)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(Error::Transport("peer channel closed")),
+        }
+    }
 }
 
 #[cfg(test)]

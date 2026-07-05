@@ -111,6 +111,12 @@ impl Node {
         Ok(Box::new(crate::chain::RpcChain::new(self.new_rpc_client()?)))
     }
 
+    /// An [`RpcBackend`](crate::agent::RpcBackend) for the node core, scoped to `wallet_name`. Holds
+    /// only connection details, so it outlives individual clients and is `Send + Sync`.
+    pub fn agent_backend(&self, wallet_name: &str) -> crate::agent::RpcBackend {
+        crate::agent::RpcBackend::new(self.rpc_url.clone(), self.cookie.clone(), self.network, wallet_name.to_string())
+    }
+
     /// Like [`regtest`](Self::regtest) but with an explicit `bitcoind` path (e.g. a patched build).
     pub fn regtest_with_binary(bitcoind: &str) -> Result<Self> {
         Self::spawn(bitcoind, true)

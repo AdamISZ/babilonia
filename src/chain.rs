@@ -12,6 +12,8 @@ use crate::Result;
 
 /// The chain-view operations the bet layer depends on. `Send` for the same reason as [`Wallet`].
 pub trait Chain: Send {
+    /// The current best block height (for absolute timelocks).
+    fn block_height(&self) -> Result<u32>;
     /// Broadcast a fully-signed transaction; returns its txid. Should tolerate a tx already in the
     /// mempool/chain.
     fn broadcast(&self, tx: &Transaction) -> Result<Txid>;
@@ -53,6 +55,10 @@ mod rpc {
     }
 
     impl Chain for RpcChain {
+        fn block_height(&self) -> Result<u32> {
+            Ok(self.client.get_block_count()? as u32)
+        }
+
         fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
             Ok(self.client.send_raw_transaction(tx)?)
         }
