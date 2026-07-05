@@ -74,3 +74,62 @@ fn two_cores_play_a_bet_over_commands() {
     assert_eq!(out_a, out_b, "dealer and player agree on the outcome");
     println!("[ok] two cores played a bet over the Command/Event API → {out_a}");
 }
+
+/// Manual-accept path: Bob does NOT auto-accept, so the proposal surfaces as a `Proposed` event and
+/// Bob's UI issues an `Accept(id)` command — exercising the `AcceptDecision::Ask` policy + pending
+/// flow.
+#[test]
+#[ignore = "requires bitcoind; run with --ignored"]
+fn manual_accept_over_commands() {
+    let node = Node::regtest().expect("regtest node");
+    node.create_funded_wallet("alice", Amount::from_sat(100_000_000)).unwrap();
+    node.create_funded_wallet("bob", Amount::from_sat(100_000_000)).unwrap();
+    node.spawn_miner(Duration::from_millis(400)).unwrap();
+
+    let (end_a, end_b) = channel_pair();
+    let cfg = |auto| Config { network: Network::Regtest, auto_accept: auto, ..Config::default() };
+
+    let (core_a, cmd_a, evt_a) = NodeCore::new(Arc::new(node.agent_backend("alice")), cfg(false));
+    let core_a = core_a.with_seeded_peer("bob", Box::new(end_a));
+    let (core_b, cmd_b, evt_b) = NodeCore::new(Arc::new(node.agent_backend("bob")), cfg(false)); // manual!
+    let core_b = core_b.with_seeded_peer("alice", Box::new(end_b));
+
+    let ha = std::thread::spawn(move || core_a.run());
+    let hb = std::thread::spawn(move || core_b.run());
+
+    cmd_a.send(Command::Propose).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+
+    // Alice's outcome on a helper thread.
+    let a_handle = std::thread::spawn(move || wait_outcome("alice", &evt_a, deadline));
+
+    // Bob: wait for the Proposed event, issue Accept, then wait for the outcome.
+    let mut out_b = None;
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        match evt_b.recv_timeout(Duration::from_millis(500)) {
+            Ok(Event::Proposed { id, stake_sats, .. }) => {
+                println!("[bob] proposed #{id} ({stake_sats} sats) → accepting");
+                cmd_b.send(Command::Accept(id)).unwrap();
+                accepted = true;
+            }
+            Ok(Event::Outcome { msg }) => {
+                out_b = Some(msg);
+                break;
+            }
+            Ok(other) => println!("[bob] {other:?}"),
+            Err(_) => {}
+        }
+    }
+
+    let out_a = a_handle.join().unwrap();
+    let _ = cmd_a.send(Command::Quit);
+    let _ = cmd_b.send(Command::Quit);
+    let _ = ha.join();
+    let _ = hb.join();
+
+    assert!(accepted, "bob saw a Proposed event and issued Accept");
+    let (out_a, out_b) = (out_a.expect("alice outcome"), out_b.expect("bob outcome"));
+    assert_eq!(out_a, out_b, "outcome agrees after manual accept");
+    println!("[ok] manual accept → {out_a}");
+}

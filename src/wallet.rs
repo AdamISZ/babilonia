@@ -23,6 +23,9 @@ pub trait Wallet: Send {
     fn receive_address(&self) -> Result<Address>;
     /// An internal change address.
     fn change_address(&self) -> Result<Address>;
+    /// Values of the spendable (confirmed) UTXOs — the proposal-sizing policy stakes a percent of
+    /// one of these.
+    fn utxo_values(&self) -> Result<Vec<Amount>>;
     /// Select one confirmed UTXO worth at least `need`; returns its outpoint and value.
     fn select_input(&self, need: Amount) -> Result<(OutPoint, Amount)>;
     /// Build an **unsigned** PSBT spending `inputs` to `outputs` (address string → amount). base64.
@@ -82,6 +85,10 @@ mod rpc {
 
         fn change_address(&self) -> Result<Address> {
             checked(&self.client.call::<String>("getrawchangeaddress", &[])?, self.network)
+        }
+
+        fn utxo_values(&self) -> Result<Vec<Amount>> {
+            Ok(self.client.list_unspent(Some(1), None, None, None, None)?.into_iter().map(|u| u.amount).collect())
         }
 
         fn select_input(&self, need: Amount) -> Result<(OutPoint, Amount)> {

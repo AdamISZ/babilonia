@@ -36,17 +36,17 @@ const REFUND_LOCKTIME_OFFSET: u32 = 100;
 // Config
 // ---------------------------------------------------------------------------
 
-/// Node configuration. Stage 2 carries the sizing/accept knobs as plain fields; Stage 4 adds the
-/// proposal/accept *policies* and persistence.
+/// Node configuration. The sizing/accept *knobs* live here; the *policies* that consume them
+/// ([`ProposalPolicy`], [`AcceptPolicy`]) are separate swappable objects.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub network: Network,
-    /// Percent of a chosen UTXO to stake (Stage 4 policy; Stage 2 uses `default_stake_sats`).
+    /// Percent of a chosen UTXO to stake (consumed by the proposal policy).
     pub stake_percent: u8,
-    /// Accept incoming proposals without asking the user.
+    /// Accept incoming proposals without asking the user (subject to `auto_accept_cap_sats`).
     pub auto_accept: bool,
-    /// Fixed stake used by `propose` until the Stage 4 sizing policy lands.
-    pub default_stake_sats: u64,
+    /// When auto-accepting, only do so for stakes ≤ this (0 = no cap).
+    pub auto_accept_cap_sats: u64,
     pub fee_sats: u64,
     pub alice_timeout: u16,
     pub pi_a_scheme: pi_a::Scheme,
@@ -58,10 +58,112 @@ impl Default for Config {
             network: Network::Regtest,
             stake_percent: 50,
             auto_accept: false,
-            default_stake_sats: 250_000,
+            auto_accept_cap_sats: 0,
             fee_sats: 2_000,
             alice_timeout: 6,
             pi_a_scheme: pi_a::Scheme::Squaring,
+        }
+    }
+}
+
+impl Config {
+    /// Load config from a `key = value` text file, falling back to defaults for anything absent or
+    /// unparseable (a missing file is fine).
+    pub fn load(path: &std::path::Path) -> Config {
+        let mut c = Config::default();
+        if let Ok(text) = std::fs::read_to_string(path) {
+            for line in text.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    let _ = c.apply(k.trim(), v.trim());
+                }
+            }
+        }
+        c
+    }
+
+    /// Persist config to `path` (creating parent dirs).
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, self.to_text())
+    }
+
+    fn to_text(&self) -> String {
+        format!(
+            "network = {}\nstake_percent = {}\nauto_accept = {}\nauto_accept_cap_sats = {}\nfee_sats = {}\nalice_timeout = {}\npi_a_scheme = {}\n",
+            self.network,
+            self.stake_percent,
+            self.auto_accept,
+            self.auto_accept_cap_sats,
+            self.fee_sats,
+            self.alice_timeout,
+            if self.pi_a_scheme == pi_a::Scheme::Poseidon { "poseidon" } else { "squaring" },
+        )
+    }
+
+    /// Apply one `key`/`value` setting (used by both the file loader and the `set` command).
+    pub fn apply(&mut self, key: &str, value: &str) -> std::result::Result<(), String> {
+        let bad = || format!("bad value for {key}: '{value}'");
+        match key {
+            "network" => self.network = value.parse().map_err(|_| bad())?,
+            "stake_percent" => self.stake_percent = value.parse().map_err(|_| bad())?,
+            "auto_accept" => self.auto_accept = value.parse().map_err(|_| bad())?,
+            "auto_accept_cap_sats" => self.auto_accept_cap_sats = value.parse().map_err(|_| bad())?,
+            "fee_sats" => self.fee_sats = value.parse().map_err(|_| bad())?,
+            "alice_timeout" => self.alice_timeout = value.parse().map_err(|_| bad())?,
+            "pi_a_scheme" => {
+                self.pi_a_scheme = match value {
+                    "squaring" => pi_a::Scheme::Squaring,
+                    "poseidon" => pi_a::Scheme::Poseidon,
+                    _ => return Err(bad()),
+                }
+            }
+            _ => return Err(format!("unknown config key '{key}'")),
+        }
+        Ok(())
+    }
+}
+
+/// **Proposal-sizing policy** — a business-logic seam. Given the wallet's spendable UTXO values and
+/// the current config, choose a stake to propose (`None` = decline). The default is [`PercentOfLargest`];
+/// a game-theoretic sizer can replace it without touching the core.
+pub trait ProposalPolicy: Send {
+    fn stake_sats(&self, utxo_values: &[Amount], config: &Config) -> Option<u64>;
+}
+
+/// Default proposal policy: stake `config.stake_percent`% of the largest spendable UTXO.
+pub struct PercentOfLargest;
+impl ProposalPolicy for PercentOfLargest {
+    fn stake_sats(&self, utxo_values: &[Amount], config: &Config) -> Option<u64> {
+        let largest = utxo_values.iter().max()?.to_sat();
+        let stake = largest.saturating_mul(config.stake_percent as u64) / 100;
+        (stake > 0).then_some(stake)
+    }
+}
+
+/// What to do with an incoming proposal.
+pub enum AcceptDecision {
+    Accept,
+    Reject,
+    /// Surface it to the user and wait for an `accept`/`reject` command.
+    Ask,
+}
+
+/// **Accept policy** — a business-logic seam. Decide what to do with an incoming proposal of
+/// `stake_sats`. The default is [`ConfigAccept`] (auto-accept within the cap, else ask).
+pub trait AcceptPolicy: Send + Sync {
+    fn decide(&self, stake_sats: u64, config: &Config) -> AcceptDecision;
+}
+
+/// Default accept policy: auto-accept iff `auto_accept` and the stake is within the cap; else ask.
+pub struct ConfigAccept;
+impl AcceptPolicy for ConfigAccept {
+    fn decide(&self, stake_sats: u64, config: &Config) -> AcceptDecision {
+        if config.auto_accept && (config.auto_accept_cap_sats == 0 || stake_sats <= config.auto_accept_cap_sats) {
+            AcceptDecision::Accept
+        } else {
+            AcceptDecision::Ask
         }
     }
 }
@@ -221,6 +323,8 @@ enum Instr {
     Propose(ProposeTerms),
     Accept,
     Reject,
+    /// Push an updated config (so the worker's accept policy sees `set` changes).
+    Config(Config),
     Quit,
 }
 
@@ -239,6 +343,9 @@ struct PeerHandle {
 pub struct NodeCore {
     backend: Arc<dyn Backend>,
     config: Config,
+    proposal_policy: Box<dyn ProposalPolicy>,
+    accept_policy: Arc<dyn AcceptPolicy>,
+    config_path: Option<std::path::PathBuf>,
     events: Sender<Event>,
     input_tx: Sender<Input>,
     input_rx: Receiver<Input>,
@@ -248,8 +355,11 @@ pub struct NodeCore {
 }
 
 impl NodeCore {
-    /// Build a core over `backend`/`config`. Returns the core, a [`Command`] sender (UI → core), and
-    /// an [`Event`] receiver (core → UI) — the swappable UI boundary.
+    /// Build a core over `backend`/`config` with the default policies. Returns the core, a
+    /// [`Command`] sender (UI → core), and an [`Event`] receiver (core → UI) — the swappable UI
+    /// boundary. Override the policies with [`with_proposal_policy`](Self::with_proposal_policy) /
+    /// [`with_accept_policy`](Self::with_accept_policy), and enable persistence with
+    /// [`with_config_path`](Self::with_config_path).
     pub fn new(backend: Arc<dyn Backend>, config: Config) -> (Self, Sender<Command>, Receiver<Event>) {
         let (input_tx, input_rx) = channel::<Input>();
         let (evt_tx, evt_rx) = channel::<Event>();
@@ -268,6 +378,9 @@ impl NodeCore {
         let core = NodeCore {
             backend,
             config,
+            proposal_policy: Box::new(PercentOfLargest),
+            accept_policy: Arc::new(ConfigAccept),
+            config_path: None,
             events: evt_tx,
             input_tx,
             input_rx,
@@ -276,6 +389,24 @@ impl NodeCore {
             next_bet_id: 1,
         };
         (core, cmd_tx, evt_rx)
+    }
+
+    /// Swap the proposal-sizing policy.
+    pub fn with_proposal_policy(mut self, policy: Box<dyn ProposalPolicy>) -> Self {
+        self.proposal_policy = policy;
+        self
+    }
+
+    /// Swap the accept policy.
+    pub fn with_accept_policy(mut self, policy: Arc<dyn AcceptPolicy>) -> Self {
+        self.accept_policy = policy;
+        self
+    }
+
+    /// Persist config to `path` on every `set` (and expect it was loaded from there at startup).
+    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
     }
 
     /// Seed an already-established peer transport (used by tests / when a connection is made out of
@@ -360,23 +491,31 @@ impl NodeCore {
     }
 
     fn propose(&mut self) {
-        let peer = match &self.peer {
-            Some(p) => p,
-            None => return self.emit(Event::Error { msg: "no peer connected".into() }),
+        if self.peer.is_none() {
+            return self.emit(Event::Error { msg: "no peer connected".into() });
+        }
+        // Size the stake via the (swappable) proposal policy over the wallet's UTXOs.
+        let utxos = match self.backend.wallet().and_then(|w| w.utxo_values()) {
+            Ok(u) => u,
+            Err(e) => return self.emit(Event::Error { msg: format!("utxos: {e}") }),
+        };
+        let stake = match self.proposal_policy.stake_sats(&utxos, &self.config) {
+            Some(s) => s,
+            None => return self.emit(Event::Error { msg: "proposal policy declined (no suitable UTXO)".into() }),
         };
         let height = match self.backend.chain().and_then(|c| c.block_height()) {
             Ok(h) => h,
             Err(e) => return self.emit(Event::Error { msg: format!("height: {e}") }),
         };
         let terms = ProposeTerms {
-            stake_sats: self.config.default_stake_sats,
+            stake_sats: stake,
             fee_sats: self.config.fee_sats,
             refund_locktime: height + REFUND_LOCKTIME_OFFSET,
             alice_timeout: self.config.alice_timeout,
             scheme: if self.config.pi_a_scheme == pi_a::Scheme::Poseidon { 1 } else { 0 },
         };
-        let _ = peer.instr.send(Instr::Propose(terms));
-        self.emit(Event::Info { msg: format!("proposed a bet of {} sats", terms.stake_sats) });
+        let _ = self.peer.as_ref().unwrap().instr.send(Instr::Propose(terms));
+        self.emit(Event::Info { msg: format!("proposed a bet of {stake} sats") });
     }
 
     fn decide(&mut self, id: BetId, accept: bool) {
@@ -392,17 +531,20 @@ impl NodeCore {
     }
 
     fn set_config(&mut self, key: &str, value: &str) {
-        let ok = match key {
-            "auto_accept" => value.parse::<bool>().map(|v| self.config.auto_accept = v).is_ok(),
-            "stake_percent" => value.parse::<u8>().map(|v| self.config.stake_percent = v).is_ok(),
-            "stake_sats" => value.parse::<u64>().map(|v| self.config.default_stake_sats = v).is_ok(),
-            _ => return self.emit(Event::Error { msg: format!("unknown config key '{key}'") }),
-        };
-        if ok {
-            self.emit(Event::Info { msg: format!("{key} = {value}") });
-        } else {
-            self.emit(Event::Error { msg: format!("bad value for {key}: '{value}'") });
+        if let Err(msg) = self.config.apply(key, value) {
+            return self.emit(Event::Error { msg });
         }
+        // Persist (if a path is set) and push the new config to the peer worker so its accept policy
+        // sees the change.
+        if let Some(path) = &self.config_path {
+            if let Err(e) = self.config.save(path) {
+                self.emit(Event::Error { msg: format!("save config: {e}") });
+            }
+        }
+        if let Some(peer) = &self.peer {
+            let _ = peer.instr.send(Instr::Config(self.config.clone()));
+        }
+        self.emit(Event::Info { msg: format!("{key} = {value}") });
     }
 
     fn spawn_peer(&mut self, addr: String, transport: Box<dyn Transport>) {
@@ -410,7 +552,8 @@ impl NodeCore {
         let to_core = self.input_tx.clone();
         let backend = self.backend.clone();
         let config = self.config.clone();
-        thread::spawn(move || peer_worker(transport, instr_rx, to_core, backend, config));
+        let accept = self.accept_policy.clone();
+        thread::spawn(move || peer_worker(transport, instr_rx, to_core, backend, config, accept));
         self.peer = Some(PeerHandle { addr, instr: instr_tx });
     }
 }
@@ -425,7 +568,8 @@ fn peer_worker(
     instr_rx: Receiver<Instr>,
     to_core: Sender<Input>,
     backend: Arc<dyn Backend>,
-    config: Config,
+    mut config: Config,
+    accept: Arc<dyn AcceptPolicy>,
 ) {
     let mut pending_terms: Option<ProposeTerms> = None;
     loop {
@@ -433,17 +577,23 @@ fn peer_worker(
         match transport.try_recv() {
             Ok(Some(frame)) => {
                 if let Some(terms) = ProposeTerms::decode(&frame) {
-                    if config.auto_accept {
-                        let _ = to_core.send(Input::Worker(WorkerEvent::Info(format!(
-                            "auto-accepting bet of {} sats",
-                            terms.stake_sats
-                        ))));
-                        if transport.send(MSG_ACCEPT).is_ok() {
-                            run_player(&mut *transport, &backend, &config, terms, &to_core);
+                    match accept.decide(terms.stake_sats, &config) {
+                        AcceptDecision::Accept => {
+                            let _ = to_core.send(Input::Worker(WorkerEvent::Info(format!(
+                                "accepting bet of {} sats",
+                                terms.stake_sats
+                            ))));
+                            if transport.send(MSG_ACCEPT).is_ok() {
+                                run_player(&mut *transport, &backend, &config, terms, &to_core);
+                            }
                         }
-                    } else {
-                        let _ = to_core.send(Input::Worker(WorkerEvent::Proposed { stake_sats: terms.stake_sats }));
-                        pending_terms = Some(terms);
+                        AcceptDecision::Reject => {
+                            let _ = transport.send(MSG_REJECT);
+                        }
+                        AcceptDecision::Ask => {
+                            let _ = to_core.send(Input::Worker(WorkerEvent::Proposed { stake_sats: terms.stake_sats }));
+                            pending_terms = Some(terms);
+                        }
                     }
                 }
             }
@@ -464,6 +614,7 @@ fn peer_worker(
                 let _ = transport.send(MSG_REJECT);
                 pending_terms = None;
             }
+            Ok(Instr::Config(c)) => config = c,
             Ok(Instr::Quit) => break,
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => break,
@@ -563,6 +714,57 @@ fn scalar(secp: &secp256k1::Secp256k1<secp256k1::All>) -> Scalar {
 
 fn rand_bit() -> usize {
     usize::from(rand::random::<bool>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_roundtrips_through_file() {
+        let dir = std::env::temp_dir().join(format!("babtest-cfg-{}", std::process::id()));
+        let path = dir.join("config.txt");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut c = Config::default();
+        c.apply("stake_percent", "7").unwrap();
+        c.apply("auto_accept", "true").unwrap();
+        c.apply("auto_accept_cap_sats", "999").unwrap();
+        c.apply("pi_a_scheme", "poseidon").unwrap();
+        c.save(&path).unwrap();
+
+        let loaded = Config::load(&path);
+        assert_eq!(loaded.stake_percent, 7);
+        assert!(loaded.auto_accept);
+        assert_eq!(loaded.auto_accept_cap_sats, 999);
+        assert_eq!(loaded.pi_a_scheme, pi_a::Scheme::Poseidon);
+
+        assert!(c.apply("nope", "x").is_err());
+        assert!(c.apply("stake_percent", "notnum").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposal_policy_sizes_percent_of_largest() {
+        let mut cfg = Config::default();
+        cfg.stake_percent = 10;
+        let utxos = [Amount::from_sat(1_000), Amount::from_sat(5_000), Amount::from_sat(200)];
+        assert_eq!(PercentOfLargest.stake_sats(&utxos, &cfg), Some(500)); // 10% of 5000
+        assert_eq!(PercentOfLargest.stake_sats(&[], &cfg), None);
+    }
+
+    #[test]
+    fn accept_policy_respects_auto_and_cap() {
+        let mut cfg = Config::default();
+        cfg.auto_accept = false;
+        assert!(matches!(ConfigAccept.decide(100, &cfg), AcceptDecision::Ask));
+        cfg.auto_accept = true;
+        cfg.auto_accept_cap_sats = 0; // no cap
+        assert!(matches!(ConfigAccept.decide(1_000_000, &cfg), AcceptDecision::Accept));
+        cfg.auto_accept_cap_sats = 500;
+        assert!(matches!(ConfigAccept.decide(400, &cfg), AcceptDecision::Accept));
+        assert!(matches!(ConfigAccept.decide(600, &cfg), AcceptDecision::Ask));
+    }
 }
 
 // ---------------------------------------------------------------------------
