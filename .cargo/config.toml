@@ -1,0 +1,12 @@
+# Cap parallel compile jobs.
+#
+# The `pi_a` feature pulls in arkworks + the Curve Trees Bulletproofs stack, which are *very*
+# compile-time-memory-heavy (generic field/curve/proof-system code, monomorphized for secp256k1).
+# Cargo defaults to one rustc/LLVM job per core (14 on this machine); at that width the concurrent
+# heavy jobs can exhaust RAM and drive the machine into swap (this happened once, 2026-07-04).
+#
+# 4 keeps peak memory well under 48 GB while the light (non-arkworks) builds stay fast. For the very
+# first full `pi_a` build, consider `-j 2` for extra headroom. Raise or delete this once you know your
+# memory headroom — it applies to *all* cargo commands in this project.
+[build]
+jobs = 4

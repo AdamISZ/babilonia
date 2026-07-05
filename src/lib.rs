@@ -25,6 +25,9 @@
 
 /// The game — business logic only (roles, outcome, the bet sequence); no bitcoin.
 pub mod game;
+/// π_a hash-circuit ZKP research (Bulletproofs + Poseidon over F_n); requires the `pi_a` feature.
+#[cfg(feature = "pi_a")]
+pub mod pi_a;
 /// The node layer — translates game verbs into bitcoin transactions (requires the `node` feature).
 #[cfg(feature = "node")]
 pub mod bet;
