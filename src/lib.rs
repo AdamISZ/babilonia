@@ -25,8 +25,9 @@
 
 /// The game — business logic only (roles, outcome, the bet sequence); no bitcoin.
 pub mod game;
-/// π_a hash-circuit ZKP research (Bulletproofs + Poseidon over F_n); requires the `pi_a` feature.
-#[cfg(feature = "pi_a")]
+/// π_a — the encrypted-outcome well-formedness proof, behind a narrow mechanism-agnostic interface.
+/// The interface is always compiled; the `pi_a` feature swaps in the real Bulletproofs+Poseidon
+/// hash-circuit implementation (else Σ-part + SHA-256 pad).
 pub mod pi_a;
 /// The node layer — translates game verbs into bitcoin transactions (requires the `node` feature).
 #[cfg(feature = "node")]

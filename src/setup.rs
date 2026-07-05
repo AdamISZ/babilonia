@@ -2,9 +2,9 @@
 //! exchange over a [`Transport`] that pre-signs the tx graph (the refund, and the settlement
 //! adaptor pre-signature locked to `D`) and commits the encrypted outcome `ctxt = a_c + H(d)`.
 //!
-//! `π_a` is produced/verified as its **Σ-part only** here (`sigma::prove_adaptor`); the hash
-//! conjunct is stubbed (`sigma::prove_recovery_circuit`), so this is the "everything works with the
-//! π_a ZKP stubbed" waypoint. `π_r` and the thimble PoKs are real. Two MuSig2 sessions run over the
+//! `π_a` is produced/verified through the narrow [`crate::pi_a`] interface (`prove`/`verify`): the
+//! Σ-part is always proved, and with the `pi_a` feature the real `ctxt = a_c + H(d)` hash conjunct
+//! is too. `π_r` and the thimble PoKs are real. Two MuSig2 sessions run over the
 //! flights: the **refund** (plain) and the **settlement** (adaptor on `D`), both single-input.
 //!
 //! On success each side holds the same pre-signed settlement (Alice can `adapt` it with `d` and
@@ -17,6 +17,7 @@ use musig2::{AdaptorSignature, LiftedSignature};
 use crate::keys::Keypair;
 use crate::messages::{AliceOpen, AliceReveal, BobAuth, BobCommit};
 use crate::musig::KeyAgg;
+use crate::pi_a;
 use crate::reveal::compute_k;
 use crate::sigma;
 use crate::txgraph::{build_refund, build_settlement, key_spend_sighash, ClaimOutput, TaprootKey};
@@ -148,11 +149,14 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
     let (mut r2_settle, settle_partial) =
         r1_settle.sign_adaptor(1, commit.settle_nonce, s.identity.sk, d_point, settle_sighash)?;
 
-    // The encrypted outcome + π_a (Σ-part; hash conjunct stubbed).
-    let a_c = &s.thimbles[s.choice];
-    let ctxt = (*a_c + sigma::h_p(&s.d)).unwrap();
-    let blind = Scalar::from(Keypair::new(&secp256k1::Secp256k1::new()).sk);
-    let pi_a = sigma::prove_adaptor(a_c, &blind, &s.d, s.choice, &thimbles, &d_point, &ctx)?.to_bytes();
+    // The encrypted outcome + π_a. `pad` is the single H definition (shared with reveal); `pi_a`
+    // proves `ctxt = a_c + H(d) ∧ a_c·G ∈ {A_i} ∧ D = d·G` (hash conjunct real with the `pi_a`
+    // feature, Σ-part otherwise).
+    let a_c = s.thimbles[s.choice];
+    let ctxt = (a_c + pi_a::pad(&s.d)).unwrap();
+    let statement = pi_a::Statement { ctxt, d_point, thimbles, ctx: ctx.clone() };
+    let witness = pi_a::Witness { t: s.d, choice: s.choice, a_c };
+    let pi_a = pi_a::prove(&statement, &witness)?.to_bytes();
 
     // Flight 3 (P4).
     ch.send(
@@ -218,7 +222,13 @@ pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) ->
 
     // Flight 3 (P4): Alice's nonces, ctxt, D, π_a, partials.
     let reveal = AliceReveal::decode(&ch.recv()?)?;
-    if !sigma::verify_adaptor_bytes(&reveal.pi_a, &thimbles, &reveal.d_point, &ctx) {
+    let statement = pi_a::Statement {
+        ctxt: reveal.ctxt,
+        d_point: reveal.d_point,
+        thimbles,
+        ctx: ctx.clone(),
+    };
+    if !pi_a::verify(&statement, &pi_a::Proof::from_bytes(&reveal.pi_a))? {
         return Err(Error::ProofInvalid("pi_a"));
     }
     let (mut r2_refund, refund_partial) = r1_refund.sign(0, reveal.refund_nonce, s.funding.sk, refund_sighash)?;

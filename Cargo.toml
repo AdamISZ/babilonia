@@ -31,13 +31,16 @@ ark-ff = { version = "0.4", optional = true }
 ark-ec = { version = "0.4", optional = true }
 ark-secp256k1 = { version = "0.4", optional = true }
 ark-std = { version = "0.4", optional = true }
+ark-serialize = { version = "0.4", optional = true }
 bulletproofs = { git = "https://github.com/simonkamp/curve-trees", default-features = false, features = ["std"], optional = true }
 merlin = { version = "2", default-features = false, optional = true }
 
 [features]
 default = ["node"]
-# `pi_a`: the (in-progress) hash-circuit ZKP research module. See `src/pi_a.rs`.
-pi_a = ["dep:ark-ff", "dep:ark-ec", "dep:ark-secp256k1", "dep:ark-std", "dep:bulletproofs", "dep:merlin"]
+# `pi_a`: the hash-circuit ZKP *implementation* (Bulletproofs+Poseidon over secp256k1). The π_a
+# *interface* (`pi_a::{Statement,Witness,Proof,pad,prove,verify}`) is always compiled; this feature
+# swaps in the real hash-circuit proof (and Poseidon `pad`) behind it. Off = Σ-part + SHA-256 pad.
+pi_a = ["dep:ark-ff", "dep:ark-ec", "dep:ark-secp256k1", "dep:ark-std", "dep:ark-serialize", "dep:bulletproofs", "dep:merlin"]
 # `node`: the regtest harness + the BIP324 covert transport, both of which drive a local bitcoind
 # over RPC. Builders who implement their own `Transport` (rendezvous, Nostr, Tor, …) can build with
 # `default-features = false` to get the transport-agnostic core library with no RPC dependencies.
