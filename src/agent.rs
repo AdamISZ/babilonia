@@ -88,6 +88,8 @@ pub enum Command {
     Receive,
     /// Ask for the wallet balance.
     Balance,
+    /// Send `sats` to `address` from the wallet (a plain payment — funds a peer, etc.).
+    Send { address: String, sats: u64 },
     /// Set a config value (`key`, `value`).
     Set { key: String, value: String },
     /// Show the current config.
@@ -109,6 +111,14 @@ pub enum Event {
     Config { text: String },
     Info { msg: String },
     Error { msg: String },
+}
+
+/// The **UI boundary** — the third swappable component (with `Backend`/`Transport`). An
+/// implementation drives the interaction: it turns user input into [`Command`]s (sent on
+/// `commands`) and renders [`Event`]s (from `events`), returning when the session ends. The default
+/// is [`crate::repl::Repl`]; a GUI (e.g. Tauri) is another impl over the same two channels.
+pub trait Ui {
+    fn run(&mut self, commands: Sender<Command>, events: Receiver<Event>);
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +327,12 @@ impl NodeCore {
                 Ok(b) => self.emit(Event::Balance { sats: b.to_sat() }),
                 Err(e) => self.emit(Event::Error { msg: format!("balance: {e}") }),
             },
+            Command::Send { address, sats } => {
+                match self.backend.wallet().and_then(|w| w.send_to(&address, Amount::from_sat(sats))) {
+                    Ok(txid) => self.emit(Event::Info { msg: format!("sent {sats} sats → {address} ({txid})") }),
+                    Err(e) => self.emit(Event::Error { msg: format!("send: {e}") }),
+                }
+            }
             Command::Set { key, value } => self.set_config(&key, &value),
             Command::ShowConfig => self.emit(Event::Config { text: format!("{:#?}", self.config) }),
             Command::Quit => return false,
@@ -606,20 +622,17 @@ mod rpc_backend {
 
         fn connect(&self, addr: &str) -> Result<Box<dyn Transport>> {
             let c = self.client("")?;
+            // Reuse an already-established v2 peer if present (e.g. the *inbound* side of a
+            // connection the peer initiated) — so both parties register a worker over the one
+            // connection. Otherwise initiate outbound via `addnode` and wait.
+            if let Some(id) = first_v2_peer(&c)? {
+                return Ok(Box::new(Bip324Transport::new(self.client("")?, id)));
+            }
             let _: serde_json::Value = c.call("addnode", &[addr.into(), "add".into()])?;
-            // Wait for a v2 peer and grab its node id.
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
-                let peers: serde_json::Value = c.call("getpeerinfo", &[])?;
-                if let Some(arr) = peers.as_array() {
-                    if let Some(id) = arr
-                        .iter()
-                        .filter(|p| p.get("transport_protocol_type").and_then(|t| t.as_str()) == Some("v2"))
-                        .filter_map(|p| p.get("id").and_then(|v| v.as_i64()))
-                        .next()
-                    {
-                        return Ok(Box::new(Bip324Transport::new(self.client("")?, id)));
-                    }
+                if let Some(id) = first_v2_peer(&c)? {
+                    return Ok(Box::new(Bip324Transport::new(self.client("")?, id)));
                 }
                 if std::time::Instant::now() > deadline {
                     return Err(Error::Protocol("peer did not connect over v2 within 30s"));
@@ -627,5 +640,16 @@ mod rpc_backend {
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
+    }
+
+    /// The node id of the first peer on a BIP324 v2 transport, if any.
+    fn first_v2_peer(c: &Client) -> Result<Option<i64>> {
+        let peers: serde_json::Value = c.call("getpeerinfo", &[])?;
+        Ok(peers.as_array().and_then(|arr| {
+            arr.iter()
+                .filter(|p| p.get("transport_protocol_type").and_then(|t| t.as_str()) == Some("v2"))
+                .filter_map(|p| p.get("id").and_then(|v| v.as_i64()))
+                .next()
+        }))
     }
 }

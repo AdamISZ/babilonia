@@ -10,7 +10,7 @@
 //! PSBTs cross this boundary (and the wire) as **base64 strings** — the form both `bitcoind` RPC and
 //! the funding messages already use. (`bitcoin::Psbt` would be the cleaner type for a later pass.)
 
-use bitcoin::{Address, Amount, OutPoint, Transaction};
+use bitcoin::{Address, Amount, OutPoint, Transaction, Txid};
 
 use crate::Result;
 
@@ -27,6 +27,8 @@ pub trait Wallet: Send {
     fn select_input(&self, need: Amount) -> Result<(OutPoint, Amount)>;
     /// Build an **unsigned** PSBT spending `inputs` to `outputs` (address string → amount). base64.
     fn create_psbt(&self, inputs: &[OutPoint], outputs: &[(String, Amount)]) -> Result<String>;
+    /// Send `amount` to `address` as a plain payment (funds a peer, external transfer, etc.).
+    fn send_to(&self, address: &str, amount: Amount) -> Result<Txid>;
     /// Sign this wallet's own inputs of a base64 PSBT; returns the updated base64 PSBT.
     fn sign_psbt(&self, psbt: &str) -> Result<String>;
     /// Combine partially-signed base64 PSBTs and finalise into a network-ready transaction.
@@ -40,7 +42,7 @@ pub use rpc::RpcWallet;
 mod rpc {
     use std::str::FromStr;
 
-    use bitcoin::{Address, Amount, Network, OutPoint, Transaction};
+    use bitcoin::{Address, Amount, Network, OutPoint, Transaction, Txid};
     use bitcoincore_rpc::{Client, RpcApi};
 
     use super::Wallet;
@@ -108,6 +110,11 @@ mod rpc {
             Ok(self
                 .client
                 .call::<String>("createpsbt", &[serde_json::json!(ins), serde_json::json!(outs)])?)
+        }
+
+        fn send_to(&self, address: &str, amount: Amount) -> Result<Txid> {
+            let addr = checked(address, self.network)?;
+            Ok(self.client.send_to_address(&addr, amount, None, None, None, None, None, None)?)
         }
 
         fn sign_psbt(&self, psbt: &str) -> Result<String> {

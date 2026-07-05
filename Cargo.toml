@@ -56,6 +56,11 @@ name = "party"
 path = "src/bin/party.rs"
 required-features = ["node"]
 
+[[bin]]
+name = "babilonia-node"
+path = "src/bin/babilonia_node.rs"
+required-features = ["node"]
+
 [dev-dependencies]
 # Integration tests are separate crates and can't see the lib's normal deps; re-declare the two
 # needed to build protocol secrets in the BIP324 handshake test. Versions unify with the deps above.

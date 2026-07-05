@@ -50,6 +50,7 @@ pub mod wallet;
 /// the `node` feature). The infra the node layer builds bet transactions on.
 #[cfg(feature = "node")]
 pub mod node;
+pub mod repl;
 pub mod reveal;
 pub mod sigma;
 pub mod transport;
