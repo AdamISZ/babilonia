@@ -121,6 +121,13 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
     let thimbles = s.thimbles.map(|a| a.base_point_mul());
     let [a1, a2] = thimbles;
 
+    // Self-protection: equal thimbles make Bob always win (a_c is the same for either choice), so
+    // Alice must never commit them. Bob rejects this too (run_bob), but Alice is the party harmed,
+    // so she is the one with the real incentive to check — and does so for every π_a scheme here.
+    if a1 == a2 {
+        return Err(Error::Protocol("degenerate thimbles: A_1 == A_2"));
+    }
+
     // Flight 1 (P2): thimbles + PoKs.
     ch.send(
         &AliceOpen {

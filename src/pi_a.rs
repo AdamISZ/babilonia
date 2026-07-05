@@ -218,6 +218,14 @@ mod squaring {
         if w.choice >= 2 {
             return Err(Error::Protocol("pi_a sq: choice out of range"));
         }
+        // `D` and `A_i` are non-identity: the invariant is enforced at the wire boundary —
+        // `messages::Reader::point` → `Point::from_slice` → `PublicKey::from_slice` rejects any
+        // O/invalid encoding, so a hostile `O` aborts Bob's decode before it reaches here (and a
+        // malformed `D` would only self-harm Alice anyway). `A_1 = A_2` is NOT excluded by the type
+        // and makes the OR (and the game) degenerate, so reject it here for health.
+        if st.thimbles[0] == st.thimbles[1] {
+            return Err(Error::Protocol("pi_a sq: A_1 == A_2"));
+        }
         let d = &st.d_point;
         let y = targets(&st.ctxt, &st.thimbles)?;
         let (c, j) = (w.choice, 1 - w.choice);
@@ -248,6 +256,11 @@ mod squaring {
     /// Verify the CDS-OR: recompute `U_i,V_i` from `(e_i,z_i)` and accept iff `e_0 + e_1 = H(transcript)`.
     pub fn verify(st: &Statement, bytes: &[u8]) -> Result<bool> {
         if bytes.len() != 128 {
+            return Ok(false);
+        }
+        // Degenerate thimbles make the OR (and the game) meaningless — a health check. (`D`/`A_i` =
+        // `O` is already rejected at the wire boundary by `Point::from_slice`; see `prove`.)
+        if st.thimbles[0] == st.thimbles[1] {
             return Ok(false);
         }
         let sc = |k: usize| Scalar::from_slice(&bytes[k * 32..k * 32 + 32]);
@@ -643,6 +656,16 @@ mod tests {
     #[test]
     fn squaring_scheme_roundtrip() {
         roundtrip_and_soundness(Scheme::Squaring);
+    }
+
+    /// Degenerate thimbles (`A_1 == A_2`) are rejected — `prove` errors, `verify` returns false.
+    #[test]
+    fn squaring_rejects_degenerate_thimbles() {
+        let (st, w) = honest(Scheme::Squaring, 0);
+        let good = prove(Scheme::Squaring, &st, &w).unwrap();
+        let degen = Statement { thimbles: [st.thimbles[0], st.thimbles[0]], ..st.clone() };
+        assert!(prove(Scheme::Squaring, &degen, &w).is_err(), "prove rejects A_1 == A_2");
+        assert!(!verify(Scheme::Squaring, &degen, &good).unwrap(), "verify rejects A_1 == A_2");
     }
 
     /// The `t²` pad satisfies the reveal identity `a_c = ctxt − t²`.
