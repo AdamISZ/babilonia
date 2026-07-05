@@ -14,7 +14,7 @@ use babilonia::keys::Keypair;
 use babilonia::musig::{adapt, extract, signature_bytes};
 use babilonia::node::Node;
 use babilonia::reveal::{claim_secret, compute_k, recover_a_c, won};
-use babilonia::pi_a::pad;
+use babilonia::pi_a::{pad, Scheme};
 use babilonia::txgraph::{
     build_claim_spend, build_refund, build_settlement, key_spend_sighash, script_spend_sighash,
     ClaimOutput, TaprootKey,
@@ -104,7 +104,7 @@ fn settle_then_bob_claims_on_regtest() {
 
     // Alice's fresh dealer secret d and the ciphertext (sent to Bob off-chain in P4).
     let d = Scalar::from(Keypair::new(&f.secp).sk);
-    let ctxt = (a_c + pad(&d)).unwrap();
+    let ctxt = (a_c + pad(Scheme::Squaring, &d)).unwrap();
 
     let fee = Amount::from_sat(2_000);
     let pot = f.v1 - fee;
@@ -120,7 +120,7 @@ fn settle_then_bob_claims_on_regtest() {
     // Bob: extract d from the published signature, decrypt a_c, confirm the win.
     let d_bob = extract(&pre, &sig).unwrap().unwrap();
     assert_eq!(d_bob, d, "Bob extracts d from the settlement");
-    let a_c_bob = recover_a_c(&ctxt, &d_bob).unwrap();
+    let a_c_bob = recover_a_c(Scheme::Squaring, &ctxt, &d_bob).unwrap();
     assert_eq!(a_c_bob, a_c, "Bob decrypts a_c = ctxt − H(d)");
     assert!(won(&a_c_bob, &a_c.base_point_mul()));
 

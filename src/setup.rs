@@ -38,6 +38,8 @@ pub struct GameParams {
     pub refund_locktime: u32,
     /// Claim-output Alice-timeout relative lock `t_1` (blocks).
     pub alice_timeout: u16,
+    /// Which π_a construction to use (both parties must agree). See [`pi_a::Scheme`].
+    pub pi_a_scheme: pi_a::Scheme,
 }
 
 /// Alice's private inputs.
@@ -153,10 +155,10 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
     // proves `ctxt = a_c + H(d) ∧ a_c·G ∈ {A_i} ∧ D = d·G` (hash conjunct real with the `pi_a`
     // feature, Σ-part otherwise).
     let a_c = s.thimbles[s.choice];
-    let ctxt = (a_c + pi_a::pad(&s.d)).unwrap();
+    let ctxt = (a_c + pi_a::pad(params.pi_a_scheme, &s.d)).unwrap();
     let statement = pi_a::Statement { ctxt, d_point, thimbles, ctx: ctx.clone() };
     let witness = pi_a::Witness { t: s.d, choice: s.choice, a_c };
-    let pi_a = pi_a::prove(&statement, &witness)?.to_bytes();
+    let pi_a = pi_a::prove(params.pi_a_scheme, &statement, &witness)?.to_bytes();
 
     // Flight 3 (P4).
     ch.send(
@@ -228,7 +230,7 @@ pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) ->
         thimbles,
         ctx: ctx.clone(),
     };
-    if !pi_a::verify(&statement, &pi_a::Proof::from_bytes(&reveal.pi_a))? {
+    if !pi_a::verify(params.pi_a_scheme, &statement, &pi_a::Proof::from_bytes(&reveal.pi_a))? {
         return Err(Error::ProofInvalid("pi_a"));
     }
     let (mut r2_refund, refund_partial) = r1_refund.sign(0, reveal.refund_nonce, s.funding.sk, refund_sighash)?;
@@ -304,6 +306,7 @@ mod tests {
             fee: Amount::from_sat(2_000),
             refund_locktime: 200,
             alice_timeout: 6,
+            pi_a_scheme: pi_a::Scheme::Squaring,
         };
         // Snapshots for the post-run check.
         let d = alice.d;
@@ -329,7 +332,7 @@ mod tests {
             .expect("completed settlement is a valid key-path signature");
         let d_bob = extract(&b.settle_pre, &final_sig).unwrap().unwrap();
         assert_eq!(d_bob, d, "Bob extracts d");
-        let a_c_bob = recover_a_c(&b.ctxt, &d_bob).unwrap();
+        let a_c_bob = recover_a_c(pi_a::Scheme::Squaring, &b.ctxt, &d_bob).unwrap();
         assert_eq!(a_c_bob, a_c, "Bob decrypts a_c");
         assert!(won(&a_c_bob, &b.thimbles[c]));
         assert_eq!(claim_secret(&w_b, &a_c_bob).unwrap().base_point_mul(), b.k, "K spendable");

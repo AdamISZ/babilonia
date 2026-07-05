@@ -45,6 +45,7 @@ fn params() -> GameParams {
         fee: Amount::from_sat(FEE_SAT),
         refund_locktime: REFUND_LOCKTIME,
         alice_timeout: ALICE_TIMEOUT,
+        pi_a_scheme: babilonia::pi_a::Scheme::Squaring,
     }
 }
 

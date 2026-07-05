@@ -171,6 +171,7 @@ fn setup_handshake_over_bip324() {
         fee: bitcoin::Amount::from_sat(2_000),
         refund_locktime: 200,
         alice_timeout: 6,
+        pi_a_scheme: babilonia::pi_a::Scheme::Squaring,
     };
 
     // Bob runs on another thread; both sides talk only through their Bip324Transport.

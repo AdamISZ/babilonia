@@ -234,7 +234,7 @@ impl<T: Transport> Bet<T> {
         let d = extract(&settle_pre, &final_sig)
             .and_then(|m| m.into_option())
             .ok_or(Error::Protocol("could not extract d from settlement"))?;
-        let a_c = recover_a_c(&ctxt, &d)?;
+        let a_c = recover_a_c(self.params.pi_a_scheme, &ctxt, &d)?;
         self.recovered_a_c = Some(a_c);
         let outcome = if won(&a_c, &thimbles[guess]) { Outcome::PlayerWins } else { Outcome::DealerWins };
         self.log(&format!("extracted d, decrypted a_c → {outcome:?}"));

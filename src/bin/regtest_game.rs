@@ -1,6 +1,6 @@
-//! A single-process **regtest game runner**: spins up a throwaway `bitcoind`, funds the pot
-//! (simplified funding), and plays a full v5 game between a Dealer and a Player over an in-memory
-//! transport, printing each step. `π_a` runs its Σ-part only (hash conjunct stubbed).
+//! A single-process **regtest game runner**: spins up a throwaway `bitcoind`, funds the pot (joint
+//! PSBT), and plays a full v5 game between a Dealer and a Player over an in-memory transport,
+//! printing each step. `π_a` uses the default `Scheme::Squaring` (`H(t)=t²`, a complete sigma proof).
 //!
 //! ```text
 //! cargo run --bin regtest-game            # player wins (y = c) and claims the pot
@@ -69,6 +69,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         fee: Amount::from_sat(2_000),
         refund_locktime: height + 100,
         alice_timeout: 6,
+        pi_a_scheme: babilonia::pi_a::Scheme::Squaring,
     };
 
     let (dch, pch) = channel_pair();

@@ -42,9 +42,10 @@ pub fn claim_secret(w_b: &Scalar, a_win: &Scalar) -> Result<Scalar> {
 }
 
 /// Bob decrypts the winning thimble scalar `a_c = ctxt − H(d)` once `d` is on-chain (v5 §P6). `H` is
-/// the single pad definition [`crate::pi_a::pad`], shared with the π_a proof so they can't disagree.
-pub fn recover_a_c(ctxt: &Scalar, d: &Scalar) -> Result<Scalar> {
-    (*ctxt + (-crate::pi_a::pad(d)))
+/// the single pad definition [`crate::pi_a::pad`] for `scheme`, shared with the π_a proof so they
+/// can't disagree.
+pub fn recover_a_c(scheme: crate::pi_a::Scheme, ctxt: &Scalar, d: &Scalar) -> Result<Scalar> {
+    (*ctxt + (-crate::pi_a::pad(scheme, d)))
         .not_zero()
         .map_err(|_| Error::Protocol("recovered a_c is zero"))
 }
@@ -89,7 +90,7 @@ mod tests {
     #[test]
     fn v5_encrypted_outcome_reveal_end_to_end() {
         use crate::musig::{adapt, extract, KeyAgg};
-        use crate::pi_a::pad;
+        use crate::pi_a::{pad, Scheme};
         use crate::sigma::{prove_adaptor, verify_adaptor};
         use rand::RngCore;
 
@@ -109,7 +110,7 @@ mod tests {
         // P4: fresh dealer secret d, ciphertext ctxt = a_c + H(d), and π_a Σ-part.
         let d = scalar(Keypair::new(&secp).sk);
         let d_point = d.base_point_mul();
-        let ctxt = (a_c + pad(&d)).unwrap();
+        let ctxt = (a_c + pad(Scheme::Squaring, &d)).unwrap();
         let r = scalar(Keypair::new(&secp).sk);
         let pi_a = prove_adaptor(&a_c, &r, &d, c, &thimbles, &d_point, b"sess").unwrap();
         assert!(verify_adaptor(&pi_a, &thimbles, &d_point, b"sess"), "Bob accepts π_a Σ-part");
@@ -131,7 +132,7 @@ mod tests {
         // P6: Bob extracts d, decrypts a_c, and checks his win.
         let d_bob = extract(&pre, &final_sig).unwrap().unwrap();
         assert_eq!(d_bob, d, "Bob extracts d from the settlement signature");
-        let a_c_bob = recover_a_c(&ctxt, &d_bob).unwrap();
+        let a_c_bob = recover_a_c(Scheme::Squaring, &ctxt, &d_bob).unwrap();
         assert_eq!(a_c_bob, a_c, "Bob decrypts a_c = ctxt − H(d)");
 
         assert!(won(&a_c_bob, &thimbles[c]));
