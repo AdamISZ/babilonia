@@ -1,0 +1,22 @@
+[package]
+name = "basic-wallet"
+version = "0.1.0"
+edition = "2021"
+description = "An elementary BDK-based Bitcoin wallet (BIP39, receive, spend) usable standalone or as a babilonia Wallet backend"
+publish = false
+
+[[bin]]
+name = "basic-bitcoin-wallet"
+path = "src/bin/wallet.rs"
+
+[dependencies]
+# babilonia — only for its `Wallet`/`Chain` integration traits (no default features: we don't want
+# babilonia's own RPC wallet, just the seam this crate implements).
+babilonia = { path = "..", default-features = false }
+# BDK: the "default Rust wallet" this crate is a minimal wrapper around, synced from a bitcoind.
+bdk_wallet = "1"
+bdk_bitcoind_rpc = "0.18"
+bip39 = { version = "2", features = ["rand"] }
+# Shared bitcoin stack — pinned to babilonia's version so the trait impl's types line up.
+bitcoin = { version = "0.32", features = ["rand-std"] }
+anyhow = "1"

@@ -1,3 +1,7 @@
+[workspace]
+members = ["basic-wallet"]
+resolver = "2"
+
 [package]
 name = "babilonia"
 version = "0.0.1"
