@@ -808,6 +808,8 @@ mod tests {
 
 #[cfg(feature = "node")]
 pub use rpc_backend::RpcBackend;
+#[cfg(feature = "basic-wallet")]
+pub use rpc_backend::BasicWalletBackend;
 
 #[cfg(feature = "node")]
 mod rpc_backend {
@@ -875,6 +877,54 @@ mod rpc_backend {
                 }
             }
             Ok(None)
+        }
+    }
+
+    /// A [`Backend`] whose wallet is the standalone **`basic-wallet`** (BDK): keys live in the app and
+    /// `bitcoind` is only a chain source + BIP324 transport. Chain/dial/accept reuse [`RpcBackend`] —
+    /// only `wallet()` differs. This is the wallet for signet/mainnet, where the node's own wallet is
+    /// not the funder (funds arrive from a faucet / elsewhere to the BDK wallet's own addresses).
+    #[cfg(feature = "basic-wallet")]
+    pub struct BasicWalletBackend {
+        inner: RpcBackend,
+        datadir: PathBuf,
+    }
+
+    #[cfg(feature = "basic-wallet")]
+    impl BasicWalletBackend {
+        /// `datadir` holds the BDK wallet state (mnemonic + birthday); created on first use.
+        pub fn new(rpc_url: String, cookie: PathBuf, network: Network, datadir: PathBuf) -> Self {
+            BasicWalletBackend { inner: RpcBackend::new(rpc_url, cookie, network, String::new()), datadir }
+        }
+    }
+
+    #[cfg(feature = "basic-wallet")]
+    impl Backend for BasicWalletBackend {
+        fn network(&self) -> Network {
+            self.inner.network
+        }
+
+        fn wallet(&self) -> Result<Box<dyn crate::wallet::Wallet>> {
+            let w = basic_wallet::BasicWallet::open_at(
+                &self.datadir,
+                self.inner.network,
+                &self.inner.rpc_url,
+                &self.inner.cookie,
+            )
+            .map_err(|e| crate::Error::Wallet(format!("{e:#}")))?;
+            Ok(Box::new(w))
+        }
+
+        fn chain(&self) -> Result<Box<dyn crate::chain::Chain>> {
+            self.inner.chain()
+        }
+
+        fn dial(&self, addr: &str) -> Result<()> {
+            self.inner.dial(addr)
+        }
+
+        fn accept(&self) -> Result<Option<(Box<dyn Transport>, String)>> {
+            self.inner.accept()
         }
     }
 }

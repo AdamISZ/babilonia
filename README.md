@@ -1,31 +1,23 @@
 # Babilonia
 
-**A Bitcoin transaction that is a fair bet without a trusted dealer, but also indistinguishable from a payment (no scripts exposed, in the full version).** Babilonia co-designs the network and chain layers so neither leaks the execution of the protocol as distinct from Alice paying Bob.
+**A Bitcoin transaction that is a fair bet without a trusted dealer, but also indistinguishable from a payment (no scripts exposed in the happy path).** Babilonia co-designs the network and chain layers so neither leaks the execution of the protocol as distinct from Alice paying Bob.
 
-1. **BIP324 covert channel** — the v2 transport's *decoy* packets carry arbitrary bytes designed to
-   look like random padding: a covert, authenticated pipe between two Bitcoin nodes.
-2. **OP_RAND emulation** (Kurbatov, [arXiv:2501.16451](https://arxiv.org/abs/2501.16451) is the basic idea, developed into a much more advanced form by [Gerhardt](https://arxiv.org/abs/2605.04975); this construction is between those two; see the [delving bitcoin thread](https://delvingbitcoin.org/t/emulating-op-rand/1409) for a discussion) —
-   a trustless two-party fair coin settled on-chain with no special script and no consensus change.
-3. **Steganographic mixing** — because the wager is a *real* economic event whose transactions are ordinary taproot payments, using it it breaks coin-history linkage while looking like normal traffic.
+1. **BIP324 covert channel** — the v2 transport's *decoy* packets carry arbitrary bytes designed to look like random padding: a covert, authenticated pipe between two Bitcoin nodes.
+2. **OP_RAND emulation** (Kurbatov, [arXiv:2501.16451](https://arxiv.org/abs/2501.16451) is the basic idea, developed into a much more advanced form by [Gerhardt](https://arxiv.org/abs/2605.04975); this construction is between those two; see the [delving bitcoin thread](https://delvingbitcoin.org/t/emulating-op-rand/1409) for a discussion) — a trustless two-party fair coin settled on-chain with no special script and no consensus change.
+3. **Steganographic mixing** — because the wager is a *real* economic event whose transactions are ordinary taproot payments, using it breaks coin-history linkage while looking like normal traffic.
 
-> **Research code.** This is a working scaffold for a thesis, not audited software. Security proofs not yet done, though there isn't a likely concern one can never be too cautious! The design is described below; the core ZK construction is written up in [`docs/PI-A-NOTES.md`](docs/PI-A-NOTES.md).
+> **Research code.** This is a working experiment, not audited software. Security proofs not yet done, though there isn't a likely concern one can never be too cautious! A detailed outline in pdf is upcoming, for now see some notes on the ZK aspect at [`docs/PI-A-NOTES.md`](docs/PI-A-NOTES.md).
 
 ## How the game works
 
-Alice (the **dealer**) picks a secret choice `c` from 1,2, encoded in a list of points `A_1, A_2`; Bob (the **player**) picks a secret guess `y` and
-**wins iff `y = c`**. The roles are symmetrical but there is no trust. One jointly-funded taproot output `U1` (the pot) is spent by a MuSig2
+Alice (the **dealer**) picks a secret choice `c` from 1,2, encoded as points `A_1, A_2`; Bob (the **player**) picks a secret guess `y` and **wins iff `y = c`**. The roles are asymmetrical but there is no trust. One jointly-funded taproot output `U1` (the pot) is spent by a MuSig2
 **adaptor signature locked to `D = d·G`** for a fresh dealer secret `d`. Both sides get ZKPs that guarantee the other behaves honestly. Alice can't be paid without
 completing that adaptor — which *posts `d` on-chain*. Bob then decrypts the outcome
 `a_c = ctxt − H(d)` (from `ctxt = a_c + H(d)`) and, if he won, claims the pot via the taproot address which he only knows the secret key for because of that decryption; otherwise Alice reclaims it after a timeout. There is also a refund Tx if the payout Tx never gets broadcast.
 
 ### The transactions
 
-The pot lives in one jointly-funded taproot output `U1`. From there, two transactions carry the
-outcome: the **settlement** spends `U1` and, by completing the adaptor, publishes `d`; the
-**claim** then spends the settlement's output — Bob's honest win is a plain **key-path** spend
-(indistinguishable from an ordinary payment), and only if a *losing* Bob griefs does Alice fall
-back to a timelock **script leaf**. A **refund** is the fallback if the settlement is never
-broadcast. (A future cooperative overlay would make even the loss path a plain key-path payment.)
+The pot lives in one jointly-funded taproot output `U1`. From there, two transactions carry the outcome: the **settlement** spends `U1` and, by completing the adaptor, publishes `d`; the **claim** then spends the settlement's output — Bob's honest win is a plain **key-path** spend (indistinguishable from an ordinary payment), and only if a *losing* Bob griefs does Alice fall back to a timelock **script leaf**. A **refund** is the fallback if the settlement is never broadcast. (A future cooperative overlay will make even the loss path a plain key-path payment.)
 
 ```
    U1  — the pot: one jointly-funded P2TR output (key-path MuSig2(P_a, P_b))
@@ -56,7 +48,7 @@ broadcast. (A future cooperative overlay would make even the loss path a plain k
  └────────────────────────────────────┘   └────────────────────────────────────┘
 ```
 
-STILL TO DO: Cooperative Alice wins case: we don't want to broadcast the script path spend on the OP_CSV condition, which is not a standard payment; but if Bob cooperates they can use an overlay spend instead, and since Bob probably prefers that, he will likely do it. Trivial to implement, just not done yet.
+STILL TO DO: Cooperative Alice wins case: we don't want to broadcast the script path spend on the OP_CSV condition, which is not a standard payment; but if Bob cooperates they can use an overlay spend instead, and since Bob probably prefers that, he will likely do it.
 
 ### Architecture
 
@@ -72,13 +64,8 @@ bet    the bitcoin translation layer — joint PSBT funding, settlement, claim.
 txgraph · musig · sigma · pi_a · reveal · setup   the crypto / tx primitives
 ```
 
-**Three components are swappable behind traits**, around the `NodeCore` orchestrator: the **UI**
-(default: CLI REPL), **network messaging** (default: BIP324), and the **wallet** (default: RPC to a
-local node). `π_a` is implemented with **two selectable proof schemes** — a sigma-based `t²`
-construction (default, no heavy deps) and a Bulletproofs+Poseidon hash circuit (behind the `pi_a`
-feature); see [`docs/PI-A-NOTES.md`](docs/PI-A-NOTES.md). Everything — sigma proofs, MuSig2 adaptor
-settlement, the taproot tx graph, joint PSBT funding, the covert channel, and the full REPL — is
-built and regtest-validated end to end.
+**Three components are swappable behind traits**, around the `NodeCore` orchestrator: the **UI** (default: CLI REPL), **network messaging** (default: BIP324), and the **wallet**. Two wallets implement the `Wallet` seam: a lightweight default that drives `bitcoind`'s own wallet over RPC, and **`basic-wallet`** — a standalone reference wallet (a thin [BDK](https://bitcoindevkit.org) wrapper: BIP39, receive, spend, single-UTXO mode; regtest/signet/mainnet), a `basic-bitcoin-wallet` CLI in this
+Cargo workspace that any wallet developer can also import. `π_a` is implemented with **two selectable proof schemes** — a sigma-based `t²` construction (default, no heavy deps) and a Bulletproofs+Poseidon hash circuit (behind the `pi_a` feature); see [`docs/PI-A-NOTES.md`](docs/PI-A-NOTES.md).
 
 ## Installation
 
@@ -94,13 +81,12 @@ cargo test          # unit tests (no bitcoind needed)
 
 The binaries drive a local `bitcoind` on **regtest**:
 
-- `babilonia-node` (the REPL, above) and `party` (a scripted two-node demo) need the **patched** Core
-  build with the `senddecoy`/`getdecoys` RPCs — build it once with `scripts/build-patched-node.sh`
-  and point `$BABILONIA_BITCOIND` at it (see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
+- `babilonia-node` (the REPL, above) and `party` (a scripted two-node demo) need the **patched** Core build with the `senddecoy`/`getdecoys` RPCs — build it once with `scripts/build-patched-node.sh` and point `$BABILONIA_BITCOIND` at it (see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
 - `regtest-game` is a quick one-shot demo needing only a stock `bitcoind` on your `PATH`.
 
-Library-only consumers who ship their own `Transport` (rendezvous, Nostr, Tor…) need no Bitcoin Core
-at all: `cargo build --no-default-features` drops the RPC dependencies entirely.
+For **signet**, build with `--features basic-wallet` and run `babilonia-node --signet` — it **attaches** to your own running (patched) signet node (`--rpc-url` / `--cookie` / `--p2p-port`) and drives the BDK `basic-wallet`; `receive` an address, fund it from a signet faucet, then `propose`. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
+Library-only consumers who ship their own `Transport` (rendezvous, Nostr, Tor…) need no Bitcoin Core at all: `cargo build --no-default-features` drops the RPC dependencies entirely.
 
 ## Quick start — run a full game
 
@@ -130,9 +116,7 @@ funded two wallets (alice, bob); U1 will be jointly funded during play
 
 ### Interactive — the `babilonia-node` REPL (two nodes, real BIP324)
 
-The main way to run it. Each node is a bitcoin node (wallet + BIP324 transport) driven by a CLI; two
-of them connect by address and bet over the covert channel. Requires the patched `bitcoind`
-(`$BABILONIA_BITCOIND` — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
+The main way to run it. Each node is a bitcoin node (wallet + BIP324 transport) driven by a CLI; two of them connect by address and bet over the covert channel. Requires the patched `bitcoind` (`$BABILONIA_BITCOIND` — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
 
 ```sh
 # terminal 1 — funded, mining node; prints its P2P address:
@@ -165,5 +149,7 @@ cargo test --test game   -- --ignored --test-threads=1     # full on-chain game 
 cargo test --test agent  -- --ignored --test-threads=1     # node core: two cores bet via Command/Event
 cargo test --test regtest_e2e -- --ignored --test-threads=1   # tx-graph e2e
 cargo test --test bip324 -- --ignored --test-threads=1        # covert channel (needs patched node)
+cargo test --features basic-wallet --test bet_basic_wallet -- --ignored --test-threads=1  # full bet on the BDK wallet
+cargo test -p basic-wallet -- --ignored --test-threads=1      # the reference wallet's own functionality
 ```
 

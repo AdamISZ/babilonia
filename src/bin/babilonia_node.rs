@@ -11,8 +11,17 @@
 //! BABILONIA_BITCOIND=… babilonia-node --join --auto-accept
 //! # then in terminal 2:  connect <addr-from-terminal-1>
 //! ```
-//! Regtest only for now (signet is a later stage). The `node` feature is required.
+//! **Signet:** `--signet` (needs `--features basic-wallet`) attaches to your already-running
+//! (patched) signet `bitcoind` and drives the BDK `basic-wallet` — fund it from a faucet. Regtest is
+//! the default and self-contained. The `node` feature is required.
+//!
+//! ```text
+//! # a signet node (patched Core, running + synced), then:
+//! babilonia-node --signet --rpc-url http://127.0.0.1:38332 --cookie ~/.bitcoin/signet/.cookie
+//! # `receive` → fund that address from a signet faucet → `balance` → `propose`.
+//! ```
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +42,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let has = |f: &str| args.iter().any(|a| a == f);
 
     if has("--signet") {
-        return Err("signet support is a later stage; use regtest for now".into());
+        #[cfg(feature = "basic-wallet")]
+        {
+            return run_signet(&args);
+        }
+        #[cfg(not(feature = "basic-wallet"))]
+        {
+            return Err("signet needs the BDK wallet — rebuild with `--features basic-wallet`".into());
+        }
     }
     let join = has("--join");
     let auto_accept = has("--auto-accept");
@@ -81,8 +97,71 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
-/// `$HOME/.babilonia/config.txt` (falls back to the current dir if `$HOME` is unset).
-fn default_config_path() -> std::path::PathBuf {
+/// `$HOME/.babilonia` (falls back to the current dir if `$HOME` is unset).
+fn babilonia_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    std::path::Path::new(&home).join(".babilonia").join("config.txt")
+    PathBuf::from(home).join(".babilonia")
+}
+
+/// `$HOME/.babilonia/config.txt`.
+fn default_config_path() -> PathBuf {
+    babilonia_dir().join("config.txt")
+}
+
+/// Bitcoin Core's default data dir for this platform (used only for the signet cookie default).
+#[cfg(feature = "basic-wallet")]
+fn default_bitcoin_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from(home).join("Library").join("Application Support").join("Bitcoin")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from(home).join(".bitcoin")
+    }
+}
+
+/// Signet: **attach** to an already-running (patched) signet `bitcoind` and drive the BDK
+/// `basic-wallet` (keys in the app; the node is only a chain source + BIP324 transport).
+#[cfg(feature = "basic-wallet")]
+fn run_signet(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use babilonia::agent::BasicWalletBackend;
+
+    let has = |f: &str| args.iter().any(|a| a == f);
+    let rpc_url = flag_value(args, "--rpc-url").unwrap_or_else(|| "http://127.0.0.1:38332".into());
+    let cookie = flag_value(args, "--cookie")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_bitcoin_dir().join("signet").join(".cookie"));
+    let p2p_port: u16 = flag_value(args, "--p2p-port").and_then(|s| s.parse().ok()).unwrap_or(38333);
+    let wallet_dir =
+        flag_value(args, "--wallet-dir").map(PathBuf::from).unwrap_or_else(|| babilonia_dir().join("signet-wallet"));
+
+    // Attach to the running node — fail fast if unreachable. No node wallet: keys live in the BDK wallet.
+    let node = Node::attach(&rpc_url, cookie.clone(), Network::Signet, p2p_port)?;
+
+    let config_path = flag_value(args, "--config").map(PathBuf::from).unwrap_or_else(default_config_path);
+    let mut config = Config::load(&config_path);
+    config.network = Network::Signet;
+    if has("--auto-accept") {
+        config.auto_accept = true;
+    }
+
+    println!("── babilonia-node up (signet) ──────────────────────────");
+    println!("node:     {rpc_url}   (attached — not managed by babilonia)");
+    println!("wallet:   basic-wallet (BDK) · state {}", wallet_dir.display());
+    println!("P2P addr: {}   (give this to the peer's `connect`)", node.p2p_addr());
+    println!("funding:  run `receive`, send signet coins to it from a faucet, then `balance`");
+    println!("config:   {} (stake {}% · auto_accept {})", config_path.display(), config.stake_percent, config.auto_accept);
+    println!("────────────────────────────────────────────────────────");
+
+    let backend = Arc::new(BasicWalletBackend::new(rpc_url, cookie, Network::Signet, wallet_dir));
+    let (core, cmd_tx, evt_rx) = NodeCore::new(backend, config);
+    let core = core.with_config_path(config_path);
+
+    let core_handle = std::thread::spawn(move || core.run());
+    let mut ui = Repl::new();
+    ui.run(cmd_tx, evt_rx);
+    let _ = core_handle.join();
+    Ok(())
 }

@@ -69,6 +69,12 @@ Three binaries exercise the game (all use the `node` feature). They sit above th
 `ui` → `agent::NodeCore` → `game` → `bet` → `txgraph`/`musig`/`sigma`/`pi_a`/`setup`, over the three
 swappable edges (`Ui`, `Transport`, `Wallet`/`Chain`).
 
+The `Wallet` edge has two implementations: the default `RpcWallet` (drives `bitcoind`'s own wallet
+over RPC — used by the binaries and babilonia's own tests) and the standalone **`basic-wallet`** crate
+(a BDK wallet where the keys live in the app, not bitcoind; behind babilonia's optional `basic-wallet`
+feature). A wallet developer integrates by implementing this `Wallet` trait — `basic-wallet` is the
+reference. See its own `basic-bitcoin-wallet` CLI and tests.
+
 - **`babilonia-node`** — the interactive **REPL** (the main way to run; see the README): each process
   is a bitcoin node driving a CLI; two connect by address and bet over the **real BIP324 decoy
   channel**. Requires the patched build (`$BABILONIA_BITCOIND`).
@@ -77,6 +83,17 @@ swappable edges (`Ui`, `Transport`, `Wallet`/`Chain`).
   BABILONIA_BITCOIND=… cargo run --bin babilonia-node                    # funded + mining node
   BABILONIA_BITCOIND=… cargo run --bin babilonia-node -- --join --auto-accept   # joining node
   ```
+
+  On **regtest** the node is spawned and self-funded (mining) for you. On **signet**, `--signet`
+  instead **attaches** to a signet node *you* already run and syncs (babilonia doesn't manage its
+  lifecycle), and the wallet is the BDK `basic-wallet` (keys in the app), funded from a faucet:
+
+  ```sh
+  cargo run --features basic-wallet --bin babilonia-node -- --signet \
+      --rpc-url http://127.0.0.1:38332 --cookie ~/.bitcoin/signet/.cookie [--p2p-port 38333] [--wallet-dir <dir>]
+  # then in the REPL:  receive → fund that address from a signet faucet → balance → propose / connect
+  ```
+  The attached signet node must still be the **patched** build for the BIP324 decoy channel.
 
 - **`party`** — a scripted (non-interactive) two-node covert run, superseded by the REPL but kept as
   a fixed dealer/player script. Requires the patched build.

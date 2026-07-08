@@ -61,6 +61,16 @@ impl BasicWallet {
         Self::load(datadir, network, client)
     }
 
+    /// Open the wallet at `datadir` for `network` — loading it if it exists, else creating a fresh
+    /// one. (Used when a caller mints a wallet on demand and doesn't care which.)
+    pub fn open_at(datadir: &Path, network: Network, rpc_url: &str, cookie: &Path) -> Result<Self> {
+        if state_path(datadir, network).exists() {
+            Self::load_at(datadir, network, rpc_url, cookie)
+        } else {
+            Ok(Self::create_new_at(datadir, network, rpc_url, cookie)?.0)
+        }
+    }
+
     /// Load an existing wallet from its state file and sync.
     pub fn load(datadir: &Path, network: Network, rpc: Client) -> Result<Self> {
         let path = state_path(datadir, network);

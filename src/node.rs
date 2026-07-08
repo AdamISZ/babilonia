@@ -73,6 +73,24 @@ impl Node {
         })
     }
 
+    /// Attach to a running node **with no wallet scope** — for callers that bring their own wallet
+    /// (e.g. the BDK `basic-wallet`, which only needs the node as a chain source + transport).
+    /// Health-checks on the base RPC endpoint.
+    pub fn attach(base_url: &str, cookie: PathBuf, network: Network, p2p_port: u16) -> Result<Self> {
+        let client = Client::new(base_url, Auth::CookieFile(cookie.clone()))?;
+        client.get_blockchain_info()?; // fail fast if unreachable
+        Ok(Node {
+            network,
+            p2p_port,
+            rpc_url: base_url.to_string(),
+            cookie,
+            wallet: String::new(),
+            child: None,
+            datadir: None,
+            client,
+        })
+    }
+
     /// A fresh **wallet-scoped** RPC client — hand one to each concurrent party so they don't share
     /// a single `Client` across threads.
     pub fn wallet_client(&self) -> Result<Client> {
