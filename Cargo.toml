@@ -19,7 +19,7 @@ secp = { version = "0.7", features = ["secp256k1", "secp256k1-invert"] }
 secp256k1 = { version = "0.31", features = ["std", "rand"] }
 # Bitcoin tx construction / taproot (its own secp256k1 0.29; byte boundary). Core to the protocol
 # (building the join/settlement txs), so unconditional — not part of the `node` feature.
-bitcoin = { version = "0.32", features = ["rand-std", "serde"] }
+bitcoin = { version = "0.32", features = ["rand-std", "serde", "base64"] }
 rand = "0.8"
 thiserror = "2"
 hex = "0.4"
@@ -32,6 +32,9 @@ serde_json = { version = "1.0", optional = true }
 # events print cleanly above the prompt). Gated behind `repl` so a builder shipping their own UI
 # (GUI, …) doesn't inherit it.
 rustyline = { version = "14", optional = true }
+# The reference wallet backend (BDK). Optional: babilonia adapts its `BasicWallet` to the `Wallet`
+# trait; a consumer using their own wallet leaves this off. (basic-wallet has no babilonia dep.)
+basic-wallet = { path = "basic-wallet", optional = true }
 # pi_a (research, feature-gated + off by default): arkworks secp256k1 scalar field + Poseidon, toward
 # the π_a hash-circuit ZKP. Bulletproofs backend = the Curve Trees generic arkworks R1CS (Campanelli
 # et al., USENIX Sec '23), which supports the secp256k1/secq256k1 cycle — pinned to arkworks 0.4.
@@ -47,6 +50,9 @@ merlin = { version = "2", default-features = false, optional = true }
 default = ["node", "repl"]
 # `repl`: the default CLI `Ui` (`repl::Repl`), built on rustyline. Off = ship your own `Ui`.
 repl = ["dep:rustyline"]
+# `basic-wallet`: adapt the reference BDK wallet to the `Wallet` trait. Needs `node` (shares the RPC
+# chain/transport). Off = bring your own `Wallet` impl.
+basic-wallet = ["dep:basic-wallet", "node"]
 # `pi_a`: the hash-circuit ZKP *implementation* (Bulletproofs+Poseidon over secp256k1). The π_a
 # *interface* (`pi_a::{Statement,Witness,Proof,pad,prove,verify}`) is always compiled; this feature
 # swaps in the real hash-circuit proof (and Poseidon `pad`) behind it. Off = Σ-part + SHA-256 pad.

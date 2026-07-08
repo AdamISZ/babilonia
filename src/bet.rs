@@ -7,11 +7,12 @@
 //! dealer `settle` (adapt with `d`, broadcast — posts `d`) → `observe` (player extracts `d` and
 //! decrypts `a_c`; dealer watches the claim output) → `claim`/`dealer_take_on_loss`.
 
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use bitcoin::key::TapTweak;
 use bitcoin::secp256k1::{Keypair as BKeypair, Message, SecretKey};
-use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxOut, Txid, Witness, XOnlyPublicKey};
+use bitcoin::{Address, Amount, Network, OutPoint, Sequence, Transaction, TxOut, Txid, Witness, XOnlyPublicKey};
 use musig2::secp::{Point, Scalar};
 use musig2::CompactSignature;
 
@@ -151,6 +152,52 @@ impl<T: Transport> Bet<T> {
         self.wallet.create_psbt(&inputs, &outputs)
     }
 
+    /// The dealer verifies the player-built funding tx before co-signing: it must spend exactly the
+    /// two agreed inputs and pay exactly U1 (the pot) plus both changes — nothing more, so the
+    /// player cannot redirect or over-fee the dealer's stake. Order-independent (the player's wallet
+    /// chose the layout).
+    fn verify_funding_psbt(
+        &self,
+        psbt_b64: &str,
+        inputs: [OutPoint; 2],
+        u1: &TaprootKey,
+        pot: Amount,
+        changes: [(&str, Amount); 2],
+    ) -> Result<()> {
+        let psbt = bitcoin::Psbt::from_str(psbt_b64).map_err(|_| Error::Decode("funding psbt"))?;
+        let tx = &psbt.unsigned_tx;
+
+        let mut got_in: Vec<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
+        let mut want_in = inputs.to_vec();
+        got_in.sort();
+        want_in.sort();
+        if got_in != want_in {
+            return Err(Error::Protocol("funding tx spends unexpected inputs"));
+        }
+
+        let spk_of = |addr: &str| -> Result<Vec<u8>> {
+            Ok(Address::from_str(addr)
+                .map_err(|_| Error::Decode("change address"))?
+                .require_network(self.network)
+                .map_err(|_| Error::Decode("change address network"))?
+                .script_pubkey()
+                .to_bytes())
+        };
+        let mut want_out = vec![
+            (u1.spk.to_bytes(), pot.to_sat()),
+            (spk_of(changes[0].0)?, changes[0].1.to_sat()),
+            (spk_of(changes[1].0)?, changes[1].1.to_sat()),
+        ];
+        let mut got_out: Vec<(Vec<u8>, u64)> =
+            tx.output.iter().map(|o| (o.script_pubkey.to_bytes(), o.value.to_sat())).collect();
+        want_out.sort();
+        got_out.sort();
+        if got_out != want_out {
+            return Err(Error::Protocol("funding tx has unexpected outputs"));
+        }
+        Ok(())
+    }
+
     /// Locate the `U1` output in `TX1` (by scriptPubKey).
     fn locate_u1(tx: &Transaction, u1: &TaprootKey) -> Result<(OutPoint, Amount)> {
         let vout = tx
@@ -266,6 +313,9 @@ impl<T: Transport> BetChain for Bet<T> {
                 .ok_or(Error::Protocol("funding input too small for stake"))
         };
 
+        // **Player builds** the whole funding tx (its wallet's natural shape) and signs its own
+        // input; the **dealer respects it** — verifying it pays exactly what was agreed, then adding
+        // its own signature. One wallet decides the transaction layout; babilonia never re-orders it.
         let (u1, tx) = match side {
             Side::Dealer => {
                 let (input, amount) = self.wallet.select_input(alice_stake + half_fee)?;
@@ -275,15 +325,16 @@ impl<T: Transport> BetChain for Bet<T> {
                 )?;
                 let reply = FundReply::decode(&self.transport.recv()?)?;
                 let p_b: secp256k1::PublicKey = reply.p_b.into();
-                let (u1, u1_addr) = self.u1_taproot(&my_key, &p_b)?;
+                let (u1, _u1_addr) = self.u1_taproot(&my_key, &p_b)?;
+                // Verify the player's tx before co-signing our own input.
                 let changes = [
-                    (change, change_of(amount, alice_stake)?),
-                    (reply.change, change_of(Amount::from_sat(reply.amount), bob_stake)?),
+                    (change.as_str(), change_of(amount, alice_stake)?),
+                    (reply.change.as_str(), change_of(Amount::from_sat(reply.amount), bob_stake)?),
                 ];
-                let psbt = self.build_funding_psbt([input, reply.input], &u1_addr, pot, changes)?;
-                let mine = self.wallet.sign_psbt(&psbt)?;
-                self.transport.send(&FundFinal { psbt: mine.clone() }.encode())?;
-                (u1, self.wallet.combine_finalize(&[&mine, &reply.psbt])?)
+                self.verify_funding_psbt(&reply.psbt, [input, reply.input], &u1, pot, changes)?;
+                let both = self.wallet.sign_psbt(&reply.psbt)?; // add our input's signature
+                self.transport.send(&FundFinal { psbt: both.clone() }.encode())?;
+                (u1, self.wallet.combine_finalize(&[&both])?) // finalise the fully-signed psbt
             }
             Side::Player => {
                 let open = FundOpen::decode(&self.transport.recv()?)?;
@@ -298,10 +349,10 @@ impl<T: Transport> BetChain for Bet<T> {
                 let psbt = self.build_funding_psbt([open.input, input], &u1_addr, pot, changes)?;
                 let mine = self.wallet.sign_psbt(&psbt)?;
                 self.transport.send(
-                    &FundReply { p_b: my_key.into(), input, amount: amount.to_sat(), change, psbt: mine.clone() }.encode(),
+                    &FundReply { p_b: my_key.into(), input, amount: amount.to_sat(), change, psbt: mine }.encode(),
                 )?;
                 let fin = FundFinal::decode(&self.transport.recv()?)?;
-                (u1, self.wallet.combine_finalize(&[&mine, &fin.psbt])?)
+                (u1, self.wallet.combine_finalize(&[&fin.psbt])?) // finalise the fully-signed tx
             }
         };
 

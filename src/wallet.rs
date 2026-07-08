@@ -139,3 +139,66 @@ mod rpc {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Adapter: the reference BDK wallet (`basic_wallet::BasicWallet`) as a `Wallet`. It lives *here*, not
+// in basic-wallet (which has no babilonia dependency) — the orphan rule permits it because babilonia
+// owns the `Wallet` trait. PSBTs cross as base64; anyhow errors map to `Error::Wallet`.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "basic-wallet")]
+mod basic_adapter {
+    use std::str::FromStr;
+
+    use basic_wallet::BasicWallet;
+    use bitcoin::{Address, Amount, OutPoint, Psbt, Transaction, Txid};
+
+    use super::Wallet;
+    use crate::{Error, Result};
+
+    fn werr<E: std::fmt::Display>(e: E) -> Error {
+        Error::Wallet(format!("{e:#}"))
+    }
+
+    impl Wallet for BasicWallet {
+        fn balance(&self) -> Result<Amount> {
+            Ok(BasicWallet::balance(self))
+        }
+        fn receive_address(&self) -> Result<Address> {
+            Ok(BasicWallet::receive_address(self))
+        }
+        fn change_address(&self) -> Result<Address> {
+            Ok(BasicWallet::change_address(self))
+        }
+        fn utxo_values(&self) -> Result<Vec<Amount>> {
+            Ok(self.list_utxos().into_iter().map(|(_, v)| v).collect())
+        }
+        fn select_input(&self, need: Amount) -> Result<(OutPoint, Amount)> {
+            self.list_utxos()
+                .into_iter()
+                .find(|(_, v)| *v >= need)
+                .ok_or(Error::Protocol("no wallet UTXO covers the amount"))
+        }
+        fn create_psbt(&self, inputs: &[OutPoint], outputs: &[(String, Amount)]) -> Result<String> {
+            Ok(BasicWallet::create_psbt(self, inputs, outputs).map_err(werr)?.to_string())
+        }
+        fn send_to(&self, address: &str, amount: Amount) -> Result<Txid> {
+            self.send(address, amount).map_err(werr)
+        }
+        fn sign_psbt(&self, psbt: &str) -> Result<String> {
+            let mut p = Psbt::from_str(psbt).map_err(|_| Error::Decode("psbt base64"))?;
+            BasicWallet::sign_psbt(self, &mut p).map_err(werr)?;
+            Ok(p.to_string())
+        }
+        fn combine_finalize(&self, psbts: &[&str]) -> Result<Transaction> {
+            let mut parsed = psbts
+                .iter()
+                .map(|s| Psbt::from_str(s).map_err(|_| Error::Decode("psbt base64")))
+                .collect::<Result<Vec<_>>>()?;
+            if parsed.is_empty() {
+                return Err(Error::Protocol("no psbts to finalize"));
+            }
+            let first = parsed.remove(0);
+            BasicWallet::combine_finalize(self, first, &parsed).map_err(werr)
+        }
+    }
+}

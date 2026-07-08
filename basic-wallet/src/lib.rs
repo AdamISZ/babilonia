@@ -1,21 +1,23 @@
 //! An elementary BDK-based Bitcoin wallet: a BIP39 seed, BIP86 taproot descriptors, synced from a
-//! bitcoind over RPC. Usable standalone (the `basic-bitcoin-wallet` binary) or as a
-//! [`babilonia::wallet::Wallet`] backend (the trait impl at the bottom of this file).
+//! bitcoind over RPC. Standalone (the `basic-bitcoin-wallet` binary) and coupling-free — it has no
+//! babilonia dependency; babilonia adapts these methods to its own `Wallet` trait on its side.
 //!
 //! Deliberately minimal — no wallet-file persistence. State is just the mnemonic + a birthday
 //! height in `<datadir>/<network>/wallet.state`, and every run re-syncs from the birthday. Fine for
 //! regtest/signet; a mainnet wallet with an old birthday would do a long initial scan.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
-use bdk_bitcoind_rpc::bitcoincore_rpc::{Client, RpcApi};
+use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
 use bdk_bitcoind_rpc::Emitter;
-use bdk_wallet::{KeychainKind, SignOptions, Wallet};
+use bdk_wallet::{KeychainKind, SignOptions, TxOrdering, Wallet};
 use bitcoin::bip32::Xpriv;
-use bitcoin::{Address, Amount, Network, OutPoint, Psbt, Transaction, Txid};
+use bitcoin::psbt::Input as PsbtInput;
+use bitcoin::{Address, Amount, Network, OutPoint, Psbt, Transaction, Txid, Weight};
 use bip39::Mnemonic;
 
 /// Addresses revealed on each keychain before a scan (a generous gap limit).
@@ -45,6 +47,18 @@ impl BasicWallet {
         std::fs::write(&path, format!("{mnemonic}\n{birthday}\n"))?;
         let w = Self::build(&mnemonic, network, rpc, birthday)?;
         Ok((w, mnemonic))
+    }
+
+    /// Convenience: connect to a bitcoind by RPC URL + cookie file, then create a new wallet.
+    pub fn create_new_at(datadir: &Path, network: Network, rpc_url: &str, cookie: &Path) -> Result<(Self, Mnemonic)> {
+        let client = Client::new(rpc_url, Auth::CookieFile(cookie.to_path_buf()))?;
+        Self::create_new(datadir, network, client)
+    }
+
+    /// Convenience: connect to a bitcoind by RPC URL + cookie file, then load an existing wallet.
+    pub fn load_at(datadir: &Path, network: Network, rpc_url: &str, cookie: &Path) -> Result<Self> {
+        let client = Client::new(rpc_url, Auth::CookieFile(cookie.to_path_buf()))?;
+        Self::load(datadir, network, client)
     }
 
     /// Load an existing wallet from its state file and sync.
@@ -148,19 +162,55 @@ impl BasicWallet {
         Ok(self.rpc.send_raw_transaction(&tx)?)
     }
 
-    /// Build an **unsigned** PSBT spending exactly `inputs` to `outputs` (for joint funding).
+    /// Build an **unsigned** PSBT spending exactly `inputs` to `outputs` — for a *joint* funding
+    /// transaction where some inputs belong to the counterparty. Inputs this wallet owns are added
+    /// directly; the rest are added as `add_foreign_utxo` (their prevout fetched from bitcoind). The
+    /// fee is pinned to `sum(inputs) − sum(outputs)` so BDK injects no change of its own, and the
+    /// input/output order is preserved so both parties build the identical transaction.
     pub fn create_psbt(&self, inputs: &[OutPoint], outputs: &[(String, Amount)]) -> Result<Psbt> {
         let mut wallet = self.wallet.lock().unwrap();
+        let owned: HashMap<OutPoint, Amount> =
+            wallet.list_unspent().map(|u| (u.outpoint, u.txout.value)).collect();
+        let mut in_sum = Amount::ZERO;
         let mut b = wallet.build_tx();
-        b.manually_selected_only();
+        b.manually_selected_only().ordering(TxOrdering::Untouched);
         for &op in inputs {
-            b.add_utxo(op)?;
+            if let Some(v) = owned.get(&op) {
+                b.add_utxo(op)?;
+                in_sum += *v;
+            } else {
+                let prevtx = self.fetch_prevtx(op.txid)?;
+                let txout = prevtx
+                    .output
+                    .get(op.vout as usize)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("prevout {op} not found"))?;
+                in_sum += txout.value;
+                // BDK wants the full prevtx (non_witness_utxo) as well as the witness_utxo.
+                let psbt_in = PsbtInput {
+                    witness_utxo: Some(txout),
+                    non_witness_utxo: Some(prevtx),
+                    ..Default::default()
+                };
+                // A taproot key-path spend: empty scriptSig + a ~64-byte Schnorr signature witness.
+                b.add_foreign_utxo(op, psbt_in, Weight::from_wu(66))?;
+            }
         }
+        let mut out_sum = Amount::ZERO;
         for (addr, amt) in outputs {
             let script = Address::from_str(addr)?.require_network(self.network)?.script_pubkey();
             b.add_recipient(script, *amt);
+            out_sum += *amt;
         }
+        let fee = in_sum.checked_sub(out_sum).ok_or_else(|| anyhow!("outputs exceed inputs"))?;
+        b.fee_absolute(fee);
         Ok(b.finish()?)
+    }
+
+    /// Fetch a full transaction from bitcoind (for a counterparty's input in a joint PSBT). Needs
+    /// `-txindex` on the node.
+    fn fetch_prevtx(&self, txid: Txid) -> Result<Transaction> {
+        Ok(self.rpc.get_raw_transaction(&txid, None)?)
     }
 
     /// Sign this wallet's own inputs of `psbt` in place.
@@ -204,69 +254,4 @@ fn descriptors(mnemonic: &Mnemonic, network: Network) -> Result<(String, String)
 
 fn state_path(datadir: &Path, network: Network) -> PathBuf {
     datadir.join(network.to_string()).join("wallet.state")
-}
-
-// ---------------------------------------------------------------------------
-// babilonia integration: implement its `Wallet` seam so this crate can back a NodeCore.
-// PSBTs cross the trait as base64 (Psbt's Display/FromStr). Errors collapse to
-// `Error::Protocol` (a static tag) — babilonia's error type has no dynamic-string wallet variant;
-// richer mapping is a follow-up when we wire babilonia onto this wallet.
-// ---------------------------------------------------------------------------
-
-use babilonia::{Error as BabErr, Result as BabResult};
-
-fn tag<T>(r: Result<T>, msg: &'static str) -> BabResult<T> {
-    r.map_err(|e| {
-        eprintln!("basic-wallet: {msg}: {e:#}");
-        BabErr::Protocol(msg)
-    })
-}
-
-impl babilonia::wallet::Wallet for BasicWallet {
-    fn balance(&self) -> BabResult<Amount> {
-        Ok(BasicWallet::balance(self))
-    }
-
-    fn receive_address(&self) -> BabResult<Address> {
-        Ok(BasicWallet::receive_address(self))
-    }
-
-    fn change_address(&self) -> BabResult<Address> {
-        Ok(BasicWallet::change_address(self))
-    }
-
-    fn utxo_values(&self) -> BabResult<Vec<Amount>> {
-        Ok(self.list_utxos().into_iter().map(|(_, v)| v).collect())
-    }
-
-    fn select_input(&self, need: Amount) -> BabResult<(OutPoint, Amount)> {
-        self.list_utxos()
-            .into_iter()
-            .find(|(_, v)| *v >= need)
-            .ok_or(BabErr::Protocol("no wallet UTXO covers the amount"))
-    }
-
-    fn create_psbt(&self, inputs: &[OutPoint], outputs: &[(String, Amount)]) -> BabResult<String> {
-        let psbt = tag(BasicWallet::create_psbt(self, inputs, outputs), "create_psbt")?;
-        Ok(psbt.to_string())
-    }
-
-    fn send_to(&self, address: &str, amount: Amount) -> BabResult<Txid> {
-        tag(self.send(address, amount), "send_to")
-    }
-
-    fn sign_psbt(&self, psbt: &str) -> BabResult<String> {
-        let mut p = Psbt::from_str(psbt).map_err(|_| BabErr::Decode("psbt base64"))?;
-        tag(BasicWallet::sign_psbt(self, &mut p), "sign_psbt")?;
-        Ok(p.to_string())
-    }
-
-    fn combine_finalize(&self, psbts: &[&str]) -> BabResult<Transaction> {
-        let mut parsed = psbts
-            .iter()
-            .map(|s| Psbt::from_str(s).map_err(|_| BabErr::Decode("psbt base64")))
-            .collect::<BabResult<Vec<_>>>()?;
-        let first = parsed.drain(..1).next().ok_or(BabErr::Protocol("no psbts"))?;
-        tag(BasicWallet::combine_finalize(self, first, &parsed), "combine_finalize")
-    }
 }

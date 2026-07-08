@@ -111,6 +111,17 @@ impl Node {
         Ok(Box::new(crate::chain::RpcChain::new(self.new_rpc_client()?)))
     }
 
+    /// The base RPC URL of this node (no wallet path) — for building external clients (e.g. a
+    /// `basic_wallet::BasicWallet`).
+    pub fn rpc_url(&self) -> &str {
+        &self.rpc_url
+    }
+
+    /// The cookie file path for this node's RPC auth.
+    pub fn cookie(&self) -> &std::path::Path {
+        &self.cookie
+    }
+
     /// An [`RpcBackend`](crate::agent::RpcBackend) for the node core, scoped to `wallet_name`. Holds
     /// only connection details, so it outlives individual clients and is `Send + Sync`.
     pub fn agent_backend(&self, wallet_name: &str) -> crate::agent::RpcBackend {

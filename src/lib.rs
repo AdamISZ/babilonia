@@ -94,6 +94,8 @@ pub enum Error {
     ProofInvalid(&'static str),
     #[error("protocol misuse: {0}")]
     Protocol(&'static str),
+    #[error("wallet: {0}")]
+    Wallet(String),
     #[error("not yet implemented: {0}")]
     Todo(&'static str),
 }

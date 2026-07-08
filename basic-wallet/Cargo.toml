@@ -10,9 +10,8 @@ name = "basic-bitcoin-wallet"
 path = "src/bin/wallet.rs"
 
 [dependencies]
-# babilonia — only for its `Wallet`/`Chain` integration traits (no default features: we don't want
-# babilonia's own RPC wallet, just the seam this crate implements).
-babilonia = { path = "..", default-features = false }
+# A standalone wallet — no babilonia dependency. babilonia depends on *this* crate (behind a feature)
+# and adapts `BasicWallet` to its `Wallet` trait; this crate stays reusable and coupling-free.
 # BDK: the "default Rust wallet" this crate is a minimal wrapper around, synced from a bitcoind.
 bdk_wallet = "1"
 bdk_bitcoind_rpc = "0.18"
