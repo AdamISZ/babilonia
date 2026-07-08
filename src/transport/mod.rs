@@ -1,5 +1,5 @@
 //! Abstract peer-to-peer channel — the seam for how Alice and Bob talk during the interactive
-//! OP_RAND setup (DESIGN §9, L1).
+//! OP_RAND setup.
 //!
 //! The whole commit-blind-reveal exchange — TX templates, `H_k`/`T`/`X` + `π_a`, `K_b` + `π_r`,
 //! MuSig2 nonce-commitment rounds and partial signatures — is a turn-based conversation over an

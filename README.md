@@ -8,7 +8,7 @@
    a trustless two-party fair coin settled on-chain with no special script and no consensus change.
 3. **Steganographic mixing** — because the wager is a *real* economic event whose transactions are ordinary taproot payments, using it it breaks coin-history linkage while looking like normal traffic.
 
-> **Research code.** This is a working scaffold for a thesis, not audited software. Security proofs not yet done, though there isn't a likely concern one can never be too cautious! See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
+> **Research code.** This is a working scaffold for a thesis, not audited software. Security proofs not yet done, though there isn't a likely concern one can never be too cautious! The design is described below; the core ZK construction is written up in [`docs/PI-A-NOTES.md`](docs/PI-A-NOTES.md).
 
 ## How the game works
 
@@ -25,8 +25,7 @@ outcome: the **settlement** spends `U1` and, by completing the adaptor, publishe
 **claim** then spends the settlement's output — Bob's honest win is a plain **key-path** spend
 (indistinguishable from an ordinary payment), and only if a *losing* Bob griefs does Alice fall
 back to a timelock **script leaf**. A **refund** is the fallback if the settlement is never
-broadcast. (A future cooperative overlay would make even the loss path a plain key-path payment —
-see the TODO in `docs/DESIGN.md`.)
+broadcast. (A future cooperative overlay would make even the loss path a plain key-path payment.)
 
 ```
    U1  — the pot: one jointly-funded P2TR output (key-path MuSig2(P_a, P_b))
@@ -62,18 +61,24 @@ STILL TO DO: Cooperative Alice wins case: we don't want to broadcast the script 
 ### Architecture
 
 ```
-game    business logic only — roles, outcome, the bet sequence. No bitcoin.
+ui (CLI REPL / GUI)  ─┐
+                      ├─ agent::NodeCore  ─  wallet · chain · transport   ← three swappable edges
+                      ┘   (actor orchestrator)
   │
-node ·  the bitcoin translation layer — joint PSBT funding, settlement, claim,
-bet     the covert transport, wallet/RPC. The only place transactions are built.
+game   business logic only — roles, outcome, the bet sequence. No bitcoin.
   │
-txgraph · musig · sigma · reveal · setup   the crypto / tx primitives
+bet    the bitcoin translation layer — joint PSBT funding, settlement, claim.
+  │
+txgraph · musig · sigma · pi_a · reveal · setup   the crypto / tx primitives
 ```
 
-The core library is transport-agnostic (`&mut dyn Transport`); the BIP324 covert channel is one
-`Transport` implementation (in the sense that someone can implement others in future). The only piece still stubbed is the `π_a` **hash circuit**
-(binding `ctxt` to `a_c`); everything else — sigma proofs, MuSig2 adaptor settlement, the taproot tx
-graph, joint PSBT funding, and the covert channel — is built and regtest-validated.
+**Three components are swappable behind traits**, around the `NodeCore` orchestrator: the **UI**
+(default: CLI REPL), **network messaging** (default: BIP324), and the **wallet** (default: RPC to a
+local node). `π_a` is implemented with **two selectable proof schemes** — a sigma-based `t²`
+construction (default, no heavy deps) and a Bulletproofs+Poseidon hash circuit (behind the `pi_a`
+feature); see [`docs/PI-A-NOTES.md`](docs/PI-A-NOTES.md). Everything — sigma proofs, MuSig2 adaptor
+settlement, the taproot tx graph, joint PSBT funding, the covert channel, and the full REPL — is
+built and regtest-validated end to end.
 
 ## Installation
 
@@ -87,12 +92,12 @@ cargo test          # unit tests (no bitcoind needed)
 
 ## Some concrete info about how to run tests locally, on regtest, to see it operating:
 
-The runners drive a local `bitcoind` on **regtest**:
+The binaries drive a local `bitcoind` on **regtest**:
 
-- `regtest-game` needs a stock `bitcoind` on your `PATH`.
-- `party` (the two-node BIP324 demo) needs the **patched** Core build with the `senddecoy`/`getdecoys`
-  RPCs. Build it once with `scripts/build-patched-node.sh` and point `$BABILONIA_BITCOIND` at it —
-  see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+- `babilonia-node` (the REPL, above) and `party` (a scripted two-node demo) need the **patched** Core
+  build with the `senddecoy`/`getdecoys` RPCs — build it once with `scripts/build-patched-node.sh`
+  and point `$BABILONIA_BITCOIND` at it (see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
+- `regtest-game` is a quick one-shot demo needing only a stock `bitcoind` on your `PATH`.
 
 Library-only consumers who ship their own `Transport` (rendezvous, Nostr, Tor…) need no Bitcoin Core
 at all: `cargo build --no-default-features` drops the RPC dependencies entirely.
@@ -123,33 +128,41 @@ funded two wallets (alice, bob); U1 will be jointly funded during play
 🎉 PLAYER won and claimed the pot.
 ```
 
-### Two windows, two nodes, over the real BIP324 covert channel
+### Interactive — the `babilonia-node` REPL (two nodes, real BIP324)
 
-Requires the patched `bitcoind` (set `BABILONIA_BITCOIND`). Every game message — the joint-funding
-sub-protocol and all four setup flights — rides the BIP324 decoy channel between the two peered nodes.
-
-**Window 1 — the dealer** (spawns its node, becomes the sole miner, prints its P2P address):
-
-```sh
-BABILONIA_BITCOIND=/path/to/patched/bitcoind cargo run --bin party -- --role dealer
-```
-
-**Window 2 — the player** (copy the address the dealer printed):
+The main way to run it. Each node is a bitcoin node (wallet + BIP324 transport) driven by a CLI; two
+of them connect by address and bet over the covert channel. Requires the patched `bitcoind`
+(`$BABILONIA_BITCOIND` — see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)).
 
 ```sh
-BABILONIA_BITCOIND=/path/to/patched/bitcoind \
-  cargo run --bin party -- --role player --connect 127.0.0.1:<port> --guess 1
+# terminal 1 — funded, mining node; prints its P2P address:
+BABILONIA_BITCOIND=… cargo run --bin babilonia-node
+
+# terminal 2 — a joining node that syncs and auto-accepts:
+BABILONIA_BITCOIND=… cargo run --bin babilonia-node -- --join --auto-accept
 ```
 
-The two nodes peer over BIP324 v2, the dealer funds the player's wallet over the channel, and the
-game plays out on the shared regtest chain. Use `--guess 1` (default) for a win, `--guess 0` for a
-loss (the dealer reclaims via the timeout leaf).
+Then drive them (each `>` is a REPL prompt):
+
+```
+(2) > connect <addr-from-terminal-1>     # only the joiner dials; node 1 auto-registers the peer
+                                         #   (wait for "· connected to …" on both before proposing)
+(2) > receive                            # → an address; fund it:
+(1) > send <that-address> 100000000      # (regtest) give the joining node coins
+(1) > set stake_percent 1                # stake 1% of a UTXO (regtest coinbases are 50 BTC)
+(1) > propose                            # → both play the bet over the decoy channel
+```
+
+Commands: `connect` · `propose` · `accept`/`reject <id>` · `receive` · `balance` ·
+`send <addr> <sats>` · `set <key> <value>` · `config` · `help` · `quit`. Config (stake %,
+`auto_accept`, …) persists to `~/.babilonia/config.txt`.
 
 ## Tests
 
 ```sh
-cargo test                                            # unit tests, no node
-cargo test --test game -- --ignored                   # full on-chain game (needs bitcoind on PATH)
+cargo test                                                 # unit tests, no node
+cargo test --test game   -- --ignored --test-threads=1     # full on-chain game (bitcoind on PATH)
+cargo test --test agent  -- --ignored --test-threads=1     # node core: two cores bet via Command/Event
 cargo test --test regtest_e2e -- --ignored --test-threads=1   # tx-graph e2e
 cargo test --test bip324 -- --ignored --test-threads=1        # covert channel (needs patched node)
 ```

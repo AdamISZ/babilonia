@@ -1,6 +1,6 @@
 # BIP324 Covert Channel — Bitcoin Core Patch Notes
 
-Findings from reading the actual v2 transport code, to scope the L1 patch (DESIGN.md §9).
+Findings from reading the actual v2 transport code, to scope the L1 covert-channel patch.
 
 > **Status [2026-07-03].** The **decoy channel is BUILT** — rows **B/B'/C** of §6 — but the
 > control API (C) landed as **RPC** (`senddecoy`/`getdecoys`), *not* the local IPC socket this doc
@@ -140,7 +140,7 @@ by design. **Prefer decoys; keep this as a fallback.**
 | A'| **Garbage detect** (recv): test peer garbage against PRF | `ProcessReceivedGarbageBytes` `net.cpp:1185` |
 | B | **Decoy emit** (send): queue covert frames, `Encrypt(..., ignore=true)`, interleave | `SocketSendData` `net.cpp:~1620`; new state in `V2Transport` |
 | B'| **Decoy route** (recv): on `ignore==true`, match frame magic → covert API | `ProcessReceivedPacketBytes` `net.cpp:1254` |
-| C | **Covert API**: send/recv opaque frames keyed by NodeId. **[BUILT as RPC** `senddecoy`/`getdecoys` — the earlier "IPC not RPC" preference was dropped: the control plane is local and never on the wire, so RPC is fine (DESIGN §9).**]** | `rpc/net.cpp` + `CConnman::SendDecoy`/`GetDecoys` |
+| C | **Covert API**: send/recv opaque frames keyed by NodeId. **[BUILT as RPC** `senddecoy`/`getdecoys` — the earlier "IPC not RPC" preference was dropped: the control plane is local and never on the wire, so RPC is fine.**]** | `rpc/net.cpp` + `CConnman::SendDecoy`/`GetDecoys` |
 
 Confined to `net.{h,cpp}` (+ a small new IPC module). Untouched: consensus, validation,
 mempool, wallet — keeps the fork tractable across rebases.

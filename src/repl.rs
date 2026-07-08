@@ -1,14 +1,18 @@
-//! The default [`Ui`](crate::agent::Ui): a line-oriented CLI **REPL**. It parses typed lines into
-//! [`Command`]s and renders [`Event`]s. Because the whole interaction is just those two channels, a
-//! GUI (Tauri, …) is a drop-in replacement for this type — nothing else changes.
+//! The default [`Ui`](crate::agent::Ui): a line-oriented CLI **REPL**, built on rustyline. It parses
+//! typed lines into [`Command`]s and renders [`Event`]s. Because the whole interaction is just those
+//! two channels, a GUI (Tauri, …) is a drop-in replacement for this type — nothing else changes.
 //!
 //! Events arrive asynchronously (a peer's bet proposal can land while you're at the prompt), so a
-//! background thread prints them as they come. (rustyline's external-print would tidy the prompt
-//! interleaving — a later polish.)
+//! background thread prints them via rustyline's **external printer**, which draws them *above* the
+//! prompt without disturbing the line you're editing. rustyline also gives line editing (backspace,
+//! cursor keys) and command history (up/down).
 
 use std::io::{self, Write};
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
+
+use rustyline::error::ReadlineError;
+use rustyline::{DefaultEditor, ExternalPrinter};
 
 use crate::agent::{Command, Event, Ui};
 
@@ -21,7 +25,7 @@ commands:
   receive               show a fresh receiving address
   balance               show wallet balance
   send <addr> <sats>    send a plain payment (e.g. fund a peer)
-  set <key> <value>     set config (auto_accept, stake_sats, stake_percent)
+  set <key> <value>     set config (stake_percent, auto_accept, auto_accept_cap_sats)
   config                show config
   help                  this help
   quit | exit           shut down";
@@ -38,45 +42,69 @@ impl Repl {
 
 impl Ui for Repl {
     fn run(&mut self, commands: Sender<Command>, events: Receiver<Event>) {
-        // Async event renderer — ends when the core drops the event sender.
-        let printer = thread::spawn(move || {
-            for ev in events {
-                render(&ev);
+        let mut rl = match DefaultEditor::new() {
+            Ok(rl) => rl,
+            Err(e) => {
+                eprintln!("repl: cannot initialise line editor: {e}");
+                let _ = commands.send(Command::Quit);
+                return;
             }
-        });
+        };
+
+        // Async events print *above* the prompt via rustyline's external printer, so they never
+        // clobber the line being typed. (Falls back to inline printing if unavailable.)
+        let ev_thread = match rl.create_external_printer() {
+            Ok(mut printer) => thread::spawn(move || {
+                for ev in events {
+                    if printer.print(render_line(&ev)).is_err() {
+                        break;
+                    }
+                }
+            }),
+            Err(_) => thread::spawn(move || {
+                for ev in events {
+                    print!("{}", render_line(&ev));
+                    let _ = io::stdout().flush();
+                }
+            }),
+        };
 
         println!("babilonia node — type 'help'");
-        let stdin = io::stdin();
-        let mut line = String::new();
         loop {
-            print!("babilonia> ");
-            let _ = io::stdout().flush();
-            line.clear();
-            match stdin.read_line(&mut line) {
-                Ok(0) => break, // EOF (Ctrl-D / piped input exhausted)
-                Ok(_) => {}
-                Err(_) => break,
-            }
-            let text = line.trim();
-            if text.is_empty() {
-                continue;
-            }
-            match parse(text) {
-                Ok(Some(Command::Quit)) => {
+            match rl.readline("babilonia> ") {
+                Ok(line) => {
+                    let text = line.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let _ = rl.add_history_entry(text);
+                    match parse(text) {
+                        Ok(Some(Command::Quit)) => {
+                            let _ = commands.send(Command::Quit);
+                            break;
+                        }
+                        Ok(Some(cmd)) => {
+                            if commands.send(cmd).is_err() {
+                                break; // core gone
+                            }
+                        }
+                        Ok(None) => {} // handled locally (help)
+                        Err(msg) => println!("? {msg}"),
+                    }
+                }
+                // Ctrl-C / Ctrl-D / EOF → quit cleanly.
+                Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                     let _ = commands.send(Command::Quit);
                     break;
                 }
-                Ok(Some(cmd)) => {
-                    if commands.send(cmd).is_err() {
-                        break; // core gone
-                    }
+                Err(e) => {
+                    eprintln!("repl: {e}");
+                    let _ = commands.send(Command::Quit);
+                    break;
                 }
-                Ok(None) => {} // handled locally (help)
-                Err(msg) => println!("? {msg}"),
             }
         }
-        let _ = commands.send(Command::Quit);
-        let _ = printer.join();
+        let _ = ev_thread.join();
     }
 }
 
@@ -141,20 +169,20 @@ pub fn parse(line: &str) -> std::result::Result<Option<Command>, String> {
     Ok(Some(cmd))
 }
 
-/// Render one [`Event`] to stdout.
-fn render(ev: &Event) {
+/// Render one [`Event`] to a printable line (trailing newline included), for the external printer.
+fn render_line(ev: &Event) -> String {
     match ev {
-        Event::Connected { peer } => println!("\n· connected to {peer}"),
+        Event::Connected { peer } => format!("· connected to {peer}\n"),
         Event::Proposed { id, from, stake_sats } => {
-            println!("\n· bet #{id} proposed by {from}: {stake_sats} sats — 'accept {id}' or 'reject {id}'")
+            format!("· bet #{id} proposed by {from}: {stake_sats} sats — 'accept {id}' or 'reject {id}'\n")
         }
-        Event::Progress { msg } => println!("  … {msg}"),
-        Event::Outcome { msg } => println!("\n· outcome: {msg}"),
-        Event::Address { address } => println!("· receive address: {address}"),
-        Event::Balance { sats } => println!("· balance: {sats} sats"),
-        Event::Config { text } => println!("{text}"),
-        Event::Info { msg } => println!("· {msg}"),
-        Event::Error { msg } => println!("! error: {msg}"),
+        Event::Progress { msg } => format!("  … {msg}\n"),
+        Event::Outcome { msg } => format!("· outcome: {msg}\n"),
+        Event::Address { address } => format!("· receive address: {address}\n"),
+        Event::Balance { sats } => format!("· balance: {sats} sats\n"),
+        Event::Config { text } => format!("{text}\n"),
+        Event::Info { msg } => format!("· {msg}\n"),
+        Event::Error { msg } => format!("! error: {msg}\n"),
     }
 }
 

@@ -24,6 +24,10 @@ sha2 = "0.10"
 # shipping a lighter Transport doesn't inherit them.
 bitcoincore-rpc = { version = "0.19", optional = true }
 serde_json = { version = "1.0", optional = true }
+# CLI REPL (default `Ui`): rustyline for line editing, history, and its external-printer (so async
+# events print cleanly above the prompt). Gated behind `repl` so a builder shipping their own UI
+# (GUI, …) doesn't inherit it.
+rustyline = { version = "14", optional = true }
 # pi_a (research, feature-gated + off by default): arkworks secp256k1 scalar field + Poseidon, toward
 # the π_a hash-circuit ZKP. Bulletproofs backend = the Curve Trees generic arkworks R1CS (Campanelli
 # et al., USENIX Sec '23), which supports the secp256k1/secq256k1 cycle — pinned to arkworks 0.4.
@@ -36,7 +40,9 @@ bulletproofs = { git = "https://github.com/simonkamp/curve-trees", default-featu
 merlin = { version = "2", default-features = false, optional = true }
 
 [features]
-default = ["node"]
+default = ["node", "repl"]
+# `repl`: the default CLI `Ui` (`repl::Repl`), built on rustyline. Off = ship your own `Ui`.
+repl = ["dep:rustyline"]
 # `pi_a`: the hash-circuit ZKP *implementation* (Bulletproofs+Poseidon over secp256k1). The π_a
 # *interface* (`pi_a::{Statement,Witness,Proof,pad,prove,verify}`) is always compiled; this feature
 # swaps in the real hash-circuit proof (and Poseidon `pad`) behind it. Off = Σ-part + SHA-256 pad.
@@ -59,7 +65,7 @@ required-features = ["node"]
 [[bin]]
 name = "babilonia-node"
 path = "src/bin/babilonia_node.rs"
-required-features = ["node"]
+required-features = ["node", "repl"]
 
 [dev-dependencies]
 # Integration tests are separate crates and can't see the lib's normal deps; re-declare the two

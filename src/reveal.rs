@@ -25,7 +25,7 @@ pub fn won(a_revealed: &Scalar, a_guessed_point: &Point) -> bool {
 
 /// Bob's pot-claim key `K = W_b + A_y`, where `W_b` is his **hidden claim key** (a public point
 /// here) and `A_y` the thimble he guessed. `W_b` MUST be distinct from Bob's funding key `P_b`
-/// (which appears in `Q`), or Alice would recover it and learn `y` — see JOIN-CONSTRUCTION §5.
+/// (which appears in `Q`), or Alice would recover it and learn `y`.
 pub fn compute_k(w_b_point: &Point, a_guessed_point: &Point) -> Result<Point> {
     (*w_b_point + *a_guessed_point)
         .not_inf()

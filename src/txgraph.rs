@@ -11,8 +11,7 @@
 //! ```
 //! Bob's honest win is thus indistinguishable from an ordinary taproot payment; the only script that
 //! can hit the chain is Alice's timeout leaf, and only when a losing Bob griefs. A *cooperative
-//! overlay* (spend `U1` straight to the winner, no settlement/scripts at all) is a future TODO —
-//! see `docs/DESIGN.md`.
+//! overlay* (spend `U1` straight to the winner, no settlement/scripts at all) is a future TODO.
 //!
 //! **Interlock** (v5 §P6): Alice cannot spend `U1` (get the pot) without completing the settlement
 //! adaptor, which posts `d`; Bob then decrypts `a_c = ctxt − H(d)` and, if he won, claims `K`.

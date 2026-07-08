@@ -1,4 +1,4 @@
-//! BIP324 covert transport — the intended production [`Transport`] (DESIGN §9), riding **decoy
+//! BIP324 covert transport — the intended production [`Transport`], riding **decoy
 //! packets** on an established BIP324 v2 session between two `bitcoind` peers.
 //!
 //! A frame `send` becomes one `senddecoy` RPC → an AEAD-encrypted decoy packet on the wire; the

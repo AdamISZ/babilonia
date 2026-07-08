@@ -1,4 +1,4 @@
-//! Sigma protocols over secp256k1 for the setup proofs (JOIN-CONSTRUCTION §9). Pure
+//! Sigma protocols over secp256k1 for the setup proofs. Pure
 //! discrete-log statements, Fiat–Shamir compiled — no SNARK, no in-circuit hash. Two primitives:
 //!
 //! - **Schnorr PoK of dlog** (`prove_dlog`/`verify_dlog`), challenge-response `(e, s)` form.

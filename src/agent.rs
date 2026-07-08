@@ -234,8 +234,19 @@ pub trait Backend: Send + Sync {
     fn network(&self) -> Network;
     fn wallet(&self) -> Result<Box<dyn Wallet>>;
     fn chain(&self) -> Result<Box<dyn Chain>>;
-    /// Establish a peer channel to `addr`.
-    fn connect(&self, addr: &str) -> Result<Box<dyn Transport>>;
+    /// Initiate a connection to `addr` — a dial only (`addnode`). Registration of the resulting peer
+    /// happens asynchronously via [`accept`](Backend::accept), so only the *initiator* dials; the
+    /// other side auto-accepts. Default: no-op (seeded-peer / test backends need no dialing).
+    fn dial(&self, _addr: &str) -> Result<()> {
+        Ok(())
+    }
+    /// If the node has an established v2 peer, return a transport to it together with its address.
+    /// The core polls this while it holds no registered peer and registers the first one that
+    /// appears — so a node auto-accepts an inbound connection with no user action. Default: `None`
+    /// (backends with no peer discovery, e.g. the in-memory test transport).
+    fn accept(&self) -> Result<Option<(Box<dyn Transport>, String)>> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +318,8 @@ const MSG_REJECT: &[u8] = &[3u8];
 enum Input {
     Command(Command),
     Worker(WorkerEvent),
+    /// Periodic tick that drives auto-accept polling of the backend for an inbound peer.
+    Tick,
 }
 
 /// A message from a peer worker to the core.
@@ -375,6 +388,16 @@ impl NodeCore {
                 }
             });
         }
+        // Auto-accept poller: ticks the core once a second so it can pick up an inbound peer.
+        {
+            let it = input_tx.clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(1));
+                if it.send(Input::Tick).is_err() {
+                    break;
+                }
+            });
+        }
         let core = NodeCore {
             backend,
             config,
@@ -430,6 +453,7 @@ impl NodeCore {
                     }
                 }
                 Input::Worker(ev) => self.handle_worker(ev),
+                Input::Tick => self.poll_accept(),
             }
         }
         if let Some(p) = &self.peer {
@@ -440,12 +464,11 @@ impl NodeCore {
     /// Returns `false` on `Quit`.
     fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
-            Command::Connect { addr } => match self.backend.connect(&addr) {
-                Ok(t) => {
-                    self.spawn_peer(addr.clone(), t);
-                    self.emit(Event::Connected { peer: addr });
-                }
-                Err(e) => self.emit(Event::Error { msg: format!("connect: {e}") }),
+            Command::Connect { addr } => match self.backend.dial(&addr) {
+                Ok(()) => self.emit(Event::Info {
+                    msg: format!("dialing {addr}… (registers automatically once connected)"),
+                }),
+                Err(e) => self.emit(Event::Error { msg: format!("dial: {e}") }),
             },
             Command::Propose => self.propose(),
             Command::Accept(id) => self.decide(id, true),
@@ -545,6 +568,18 @@ impl NodeCore {
             let _ = peer.instr.send(Instr::Config(self.config.clone()));
         }
         self.emit(Event::Info { msg: format!("{key} = {value}") });
+    }
+
+    /// Auto-accept: while we hold no peer, register the first established v2 peer the backend
+    /// reports (an inbound connection, or the outbound one our own `dial` just opened).
+    fn poll_accept(&mut self) {
+        if self.peer.is_some() {
+            return;
+        }
+        if let Ok(Some((transport, addr))) = self.backend.accept() {
+            self.spawn_peer(addr.clone(), transport);
+            self.emit(Event::Connected { peer: addr });
+        }
     }
 
     fn spawn_peer(&mut self, addr: String, transport: Box<dyn Transport>) {
@@ -777,7 +812,6 @@ pub use rpc_backend::RpcBackend;
 #[cfg(feature = "node")]
 mod rpc_backend {
     use std::path::PathBuf;
-    use std::time::Duration;
 
     use bitcoin::Network;
     use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -787,7 +821,7 @@ mod rpc_backend {
     use crate::transport::bip324::Bip324Transport;
     use crate::transport::Transport;
     use crate::wallet::RpcWallet;
-    use crate::{Error, Result};
+    use crate::Result;
 
     /// The default [`Backend`]: mints RPC wallet/chain clients and BIP324 transports against a local
     /// (patched) `bitcoind`. Holds only connection details (Send + Sync), not the node itself, so it
@@ -822,36 +856,25 @@ mod rpc_backend {
             Ok(Box::new(RpcChain::new(self.client("")?)))
         }
 
-        fn connect(&self, addr: &str) -> Result<Box<dyn Transport>> {
+        fn dial(&self, addr: &str) -> Result<()> {
             let c = self.client("")?;
-            // Reuse an already-established v2 peer if present (e.g. the *inbound* side of a
-            // connection the peer initiated) — so both parties register a worker over the one
-            // connection. Otherwise initiate outbound via `addnode` and wait.
-            if let Some(id) = first_v2_peer(&c)? {
-                return Ok(Box::new(Bip324Transport::new(self.client("")?, id)));
-            }
             let _: serde_json::Value = c.call("addnode", &[addr.into(), "add".into()])?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            loop {
-                if let Some(id) = first_v2_peer(&c)? {
-                    return Ok(Box::new(Bip324Transport::new(self.client("")?, id)));
-                }
-                if std::time::Instant::now() > deadline {
-                    return Err(Error::Protocol("peer did not connect over v2 within 30s"));
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
+            Ok(())
         }
-    }
 
-    /// The node id of the first peer on a BIP324 v2 transport, if any.
-    fn first_v2_peer(c: &Client) -> Result<Option<i64>> {
-        let peers: serde_json::Value = c.call("getpeerinfo", &[])?;
-        Ok(peers.as_array().and_then(|arr| {
-            arr.iter()
-                .filter(|p| p.get("transport_protocol_type").and_then(|t| t.as_str()) == Some("v2"))
-                .filter_map(|p| p.get("id").and_then(|v| v.as_i64()))
-                .next()
-        }))
+        fn accept(&self) -> Result<Option<(Box<dyn Transport>, String)>> {
+            let c = self.client("")?;
+            let peers: serde_json::Value = c.call("getpeerinfo", &[])?;
+            let peer = peers
+                .as_array()
+                .and_then(|arr| arr.iter().find(|p| p.get("transport_protocol_type").and_then(|t| t.as_str()) == Some("v2")));
+            if let Some(p) = peer {
+                if let Some(id) = p.get("id").and_then(|v| v.as_i64()) {
+                    let addr = p.get("addr").and_then(|a| a.as_str()).unwrap_or("peer").to_string();
+                    return Ok(Some((Box::new(Bip324Transport::new(self.client("")?, id)), addr)));
+                }
+            }
+            Ok(None)
+        }
     }
 }

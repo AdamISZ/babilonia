@@ -4,7 +4,7 @@
 //! (aggregate key, adaptor pre-signature, adapt, extract) rather than raw round state. Two
 //! parties only (`P_a` = index 0, `P_b` = index 1).
 //!
-//! **Nonce hygiene is load-bearing** (DESIGN §10 open #2): every tx is a *distinct* session
+//! **Nonce hygiene is load-bearing**: every tx is a *distinct* session
 //! (RefundTx, SettleTx) and MUST use an independent `nonce_seed`, or the shared key leaks. The
 //! two-round exchange is BIP327's commitment discipline.
 //!

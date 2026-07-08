@@ -1,6 +1,6 @@
 //! Game parameters — the content of Alice's opening proposal to Bob.
 //!
-//! v1 defaults (JOIN-CONSTRUCTION §5a): equal stakes, deterministic split = own stake back,
+//! v1 defaults: equal stakes, deterministic split = own stake back,
 //! a single wager `delta`. Amount/fee shaping for payment-mimicry is deliberately out of scope
 //! for the first cut.
 

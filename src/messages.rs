@@ -6,7 +6,7 @@
 //! follow key exchange, since a MuSig2 session needs both keys to form the aggregate:
 //! ```text
 //! 1. AliceOpen   A→B : P_a, thimbles A_1,A_2 (+ PoKs)                                        (P2)
-//! 2. BobCommit   B→A : P_b, K=P_b+A_y (+ π_r), refund & settlement nonces                    (P3)
+//! 2. BobCommit   B→A : P_b, K=W_b+A_y (+ π_r), refund & settlement nonces                    (P3)
 //! 3. AliceReveal A→B : refund & settlement nonces, ctxt=a_c+H(d), D=d·G, π_a (Σ-part),
 //!                      refund & settlement partials                                          (P4)
 //! 4. BobAuth     B→A : refund & settlement partials (authorises the D-adaptor pre-sig)       (P5)
@@ -71,7 +71,8 @@ pub struct AliceOpen {
 }
 
 /// Flight 2 (P3) — Bob → Alice. His funding key `P_b` (so Alice can form `Q`), claim key
-/// `K = P_b + A_y` (+ `π_r`), and his public nonces for the refund and settlement MuSig2 sessions.
+/// `K = W_b + A_y` (`W_b` = Bob's fresh *hidden* claim key, `≠ P_b`) with `π_r`, and his public
+/// nonces for the refund and settlement MuSig2 sessions.
 #[derive(Clone, Debug)]
 pub struct BobCommit {
     pub p_b: Point,

@@ -26,7 +26,9 @@ babilonia = { version = "…", default-features = false }
 ```
 
 `cargo build --no-default-features` compiles the core with `bitcoincore-rpc`/`serde_json` absent from
-the dependency tree entirely; the power-user path is the default (`node` enabled). The BIP324
+the dependency tree entirely; the power-user path is the default (`node` enabled). The default CLI
+`Ui` is likewise behind a `repl` feature (pulling in `rustyline`), so a builder shipping their own UI
+(a GUI, say) drops that too. The BIP324
 transport itself — `Bip324Transport::new(rpc_client, peer_id)` — is just a thin `Transport` over the
 `senddecoy`/`getdecoys` RPCs, so it's the reference implementation of the covert tier, not a special
 case in the protocol.
@@ -34,7 +36,7 @@ case in the protocol.
 ### Run the patched node as a *dedicated comms node* (no funds)
 
 Don't point Babilonia at the node holding your coins. Run the patched `bitcoind` as a throwaway
-relay daemon with **no wallet / no funds** (per DESIGN §9's node-decoupling). This reframes "trust a
+relay daemon with **no wallet / no funds** (node-decoupling). This reframes "trust a
 Core fork with my money" into "run a relay that happens to speak Bitcoin P2P," and is the intended
 topology anyway.
 
@@ -63,9 +65,26 @@ transport, and the runner binaries all pick up `$BABILONIA_BITCOIND`.
 
 ## Runners
 
-Two end-to-end runners exercise the full v5 game (both use the `node` feature; see the README for
-sample output). They sit above the layering `game` (business logic) → `node`/`bet` (bitcoin
-translation) → `txgraph`/`musig`/`sigma`/`setup` (primitives):
+Three binaries exercise the game (all use the `node` feature). They sit above the layering:
+`ui` → `agent::NodeCore` → `game` → `bet` → `txgraph`/`musig`/`sigma`/`pi_a`/`setup`, over the three
+swappable edges (`Ui`, `Transport`, `Wallet`/`Chain`).
+
+- **`babilonia-node`** — the interactive **REPL** (the main way to run; see the README): each process
+  is a bitcoin node driving a CLI; two connect by address and bet over the **real BIP324 decoy
+  channel**. Requires the patched build (`$BABILONIA_BITCOIND`).
+
+  ```sh
+  BABILONIA_BITCOIND=… cargo run --bin babilonia-node                    # funded + mining node
+  BABILONIA_BITCOIND=… cargo run --bin babilonia-node -- --join --auto-accept   # joining node
+  ```
+
+- **`party`** — a scripted (non-interactive) two-node covert run, superseded by the REPL but kept as
+  a fixed dealer/player script. Requires the patched build.
+
+  ```sh
+  BABILONIA_BITCOIND=… cargo run --bin party -- --role dealer
+  BABILONIA_BITCOIND=… cargo run --bin party -- --role player --connect <addr> [--guess 0|1]
+  ```
 
 - **`regtest-game`** — single process: spins up a throwaway regtest `bitcoind`, funds two wallets,
   and plays a full game (joint PSBT funding → settlement → claim) over an in-memory transport. Needs
@@ -76,20 +95,8 @@ translation) → `txgraph`/`musig`/`sigma`/`setup` (primitives):
   cargo run --bin regtest-game -- --lose  # player loses → dealer reclaims after timeout
   ```
 
-- **`party`** — the two-window / two-node covert deployment: each process drives its own `bitcoind`,
-  and the whole game (funding coordination + the four setup flights) rides the **real BIP324 decoy
-  channel** between the two peered nodes. Requires the patched build (`$BABILONIA_BITCOIND`).
-
-  ```sh
-  # window 1 (dealer + sole miner) — prints its P2P address:
-  BABILONIA_BITCOIND=… cargo run --bin party -- --role dealer
-  # window 2 (player), using the address it printed:
-  BABILONIA_BITCOIND=… cargo run --bin party -- --role player --connect <addr> [--guess 0|1]
-  ```
-
-  The dealer is the sole block producer (a background miner); the player's node spawns *unfunded* so
-  it syncs to the dealer's chain rather than forking, and the dealer funds the player's wallet over
-  the channel before play begins.
+For the two-node runners the first node is the sole block producer (background miner); a `--join`
+node spawns *unfunded* and syncs to it rather than forking.
 
 ### Why the build stays covert
 
