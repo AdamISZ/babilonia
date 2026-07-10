@@ -107,17 +107,25 @@ fn full_bet_with_basic_wallet_player_wins() {
     assert_eq!(player_res.unwrap(), Outcome::PlayerWins);
     assert_eq!(dealer_res.unwrap(), Outcome::PlayerWins);
 
-    // The dealer persisted a *broadcastable* refund to disk before funding was ever broadcast — the
-    // safety net that lets funds be reclaimed from U1 even if the process dies mid-bet.
-    let files: Vec<_> = std::fs::read_dir(&refund_dir).expect("refund dir").filter_map(|e| e.ok()).collect();
-    assert_eq!(files.len(), 1, "exactly one refund file persisted");
-    let content = std::fs::read_to_string(files[0].path()).unwrap();
+    // On disk: the human-readable broadcastable refund + the full crash-recovery record.
+    let dir: Vec<_> = std::fs::read_dir(&refund_dir).expect("state dir").filter_map(|e| e.ok()).collect();
+    let refund_txt = dir.iter().find(|e| e.file_name().to_string_lossy().starts_with("refund-")).expect("refund-*.txt");
+    let json = dir.iter().find(|e| e.file_name().to_string_lossy().ends_with(".json")).expect("<id>.json record");
+
+    let content = std::fs::read_to_string(refund_txt.path()).unwrap();
     let hex = content.lines().find_map(|l| l.strip_prefix("refund_tx: ")).expect("refund_tx line").trim();
     let refund: bitcoin::Transaction = bitcoin::consensus::encode::deserialize_hex(hex).expect("valid refund tx");
     assert_eq!(refund.input.len(), 1, "refund spends the single U1 output");
     assert!(!refund.input[0].witness.is_empty(), "refund is fully signed (witnessed)");
     assert_eq!(refund.output.len(), 2, "refund returns stakes to both funders");
+
+    // The record round-trips through disk and carries the state to rebuild that refund after a crash.
+    let rec = babilonia::persist::BetRecord::load(&json.path()).expect("load record");
+    assert_eq!(rec.phase, babilonia::persist::Phase::Done, "dealer bet persisted through to Done");
+    assert!(rec.funding_tx.is_some(), "funding tx persisted");
+    let setup = rec.setup.expect("setup persisted in record");
+    assert_eq!(setup.refund_tx.compute_txid(), refund.compute_txid(), "record's refund matches the broadcastable one");
     let _ = std::fs::remove_dir_all(&refund_dir);
 
-    println!("[ok] full bet with basic-wallet (BDK) — joint PSBT funding + persisted broadcastable refund ✓");
+    println!("[ok] full bet with basic-wallet (BDK) — joint funding + broadcastable refund + round-tripped recovery record ✓");
 }

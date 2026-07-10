@@ -13,6 +13,7 @@
 use bitcoin::{absolute::LockTime, Amount, OutPoint, Transaction, TxOut, XOnlyPublicKey};
 use musig2::secp::{Point, Scalar};
 use musig2::{AdaptorSignature, LiftedSignature};
+use serde::{Deserialize, Serialize};
 
 use crate::keys::Keypair;
 use crate::messages::{AliceOpen, AliceReveal, BobAuth, BobCommit};
@@ -25,7 +26,7 @@ use crate::transport::Transport;
 use crate::{Error, Result};
 
 /// Parameters both parties agree on before the driver runs (funding + payout shape).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GameParams {
     /// The confirmed pot outpoint `U1` and its value.
     pub u1_outpoint: OutPoint,
@@ -43,6 +44,7 @@ pub struct GameParams {
 }
 
 /// Alice's private inputs.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AliceSecrets {
     pub identity: Keypair,
     /// Thimble secret scalars `a_1, a_2` (thimbles `A_i = a_i·G`).
@@ -54,6 +56,7 @@ pub struct AliceSecrets {
 }
 
 /// Bob's private inputs.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BobSecrets {
     pub funding: Keypair,
     /// Bob's hidden claim key `W_b` (≠ funding key).

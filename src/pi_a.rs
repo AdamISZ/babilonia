@@ -75,7 +75,7 @@ impl Proof {
 /// Which π_a construction to use. **PoC flag** — both prove the same relation `ctxt = a_c + H(t) ∧
 /// a_c·G ∈ {A_i} ∧ D = t·G`; they differ in `H` and the proof machinery. Which is right for a real
 /// system is open research.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Scheme {
     /// **Sigma-based (squaring).** `H(t) = t²`; well-formedness is a CDS-OR of two Chaum–Pedersen
     /// DLEQ proofs (`docs/SquaringBasedProof.pdf`). No heavy deps, complete, cheap. Security rests on

@@ -95,6 +95,14 @@ reference. See its own `basic-bitcoin-wallet` CLI and tests.
   ```
   The attached signet node must still be the **patched** build for the BIP324 decoy channel.
 
+  **Crash recovery.** Every bet's full state is persisted under `<config-dir>/bets/` (default
+  `~/.babilonia/bets/`) at each transition — a `<id>.json` record (secrets, params, and the
+  funding/settlement/refund txs + signatures) plus a human-readable `refund-<u1txid>.txt`, written
+  *before* funding is broadcast. If a node crashes or restarts mid-bet, `recover` lists the open bets
+  and what each needs, `recover <id>` drives the right action (settle / claim / reclaim), and
+  `recover <id> refund` broadcasts the refund once its locktime passes — all from the record alone,
+  no peer required. (Records hold secrets in clear; encryption at rest is a planned follow-on.)
+
 - **`party`** — a scripted (non-interactive) two-node covert run, superseded by the REPL but kept as
   a fixed dealer/player script. Requires the patched build.
 

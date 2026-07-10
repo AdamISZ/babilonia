@@ -41,6 +41,10 @@ pub mod keys;
 pub mod messages;
 pub mod musig;
 pub mod params;
+/// Crash-recoverable bet records — the full bet state persisted to disk at each phase transition.
+pub mod persist;
+/// Crash recovery — drive the remaining on-chain actions from a persisted [`persist::BetRecord`].
+pub mod recover;
 pub mod proofs;
 pub mod protocol;
 pub mod setup;

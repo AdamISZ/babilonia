@@ -200,6 +200,9 @@ pub enum Command {
     Set { key: String, value: String },
     /// Show the current config.
     ShowConfig,
+    /// Crash recovery: `id=None` lists persisted bets + what each needs; `id=Some` executes the
+    /// forward action (settle / claim / reclaim), or the refund if `refund` is set.
+    Recover { id: Option<String>, refund: bool },
     /// Shut the node down.
     Quit,
 }
@@ -508,9 +511,63 @@ impl NodeCore {
             }
             Command::Set { key, value } => self.set_config(&key, &value),
             Command::ShowConfig => self.emit(Event::Config { text: format!("{:#?}", self.config) }),
+            Command::Recover { id, refund } => self.recover_cmd(id, refund),
             Command::Quit => return false,
         }
         true
+    }
+
+    /// Handle `recover`: list persisted bets (`id=None`) or drive one bet's recovery from disk.
+    fn recover_cmd(&self, id: Option<String>, refund: bool) {
+        let Some(dir) = self.config.state_dir.clone() else {
+            return self.emit(Event::Error { msg: "recover: no state dir (persistence off)".into() });
+        };
+        let chain = match self.backend.chain() {
+            Ok(c) => c,
+            Err(e) => return self.emit(Event::Error { msg: format!("recover: chain: {e}") }),
+        };
+        match id {
+            None => {
+                let mut any = false;
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for p in entries.flatten().map(|e| e.path()) {
+                        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                            continue;
+                        }
+                        if let Ok(rec) = crate::persist::BetRecord::load(&p) {
+                            if let Ok(a) = crate::recover::assess(&rec, &*chain) {
+                                any = true;
+                                let mark = if a.actionable { "▶" } else { " " };
+                                self.emit(Event::Info {
+                                    msg: format!("{mark} {} [{}] {:?} — {}", &a.id[..8.min(a.id.len())], a.role, a.phase, a.summary),
+                                });
+                            }
+                        }
+                    }
+                }
+                if !any {
+                    self.emit(Event::Info { msg: format!("no recoverable bets under {}", dir.display()) });
+                }
+            }
+            Some(id) => {
+                let Some(path) = find_record(&dir, &id) else {
+                    return self.emit(Event::Error { msg: format!("recover: no bet matching '{id}'") });
+                };
+                let rec = match crate::persist::BetRecord::load(&path) {
+                    Ok(r) => r,
+                    Err(e) => return self.emit(Event::Error { msg: format!("recover: {e}") }),
+                };
+                let result = if refund {
+                    crate::recover::broadcast_refund(&rec, &*chain)
+                } else {
+                    self.backend.wallet().and_then(|w| crate::recover::recover(&rec, &*chain, &*w))
+                };
+                match result {
+                    Ok(msg) => self.emit(Event::Info { msg: format!("recover {id}: {msg}") }),
+                    Err(e) => self.emit(Event::Error { msg: format!("recover {id}: {e}") }),
+                }
+            }
+        }
     }
 
     fn handle_worker(&mut self, ev: WorkerEvent) {
@@ -618,6 +675,15 @@ impl NodeCore {
 // Peer worker — owns one transport; idles polling for incoming proposals and
 // local instructions, and runs a bet session (dealer or player) end to end.
 // ---------------------------------------------------------------------------
+
+/// Find a bet record file whose id starts with `prefix` — so users can type the short id shown by
+/// `recover` rather than the full 32-char hex.
+fn find_record(dir: &std::path::Path, prefix: &str) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| {
+        p.extension().and_then(|x| x.to_str()) == Some("json")
+            && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with(prefix))
+    })
+}
 
 fn peer_worker(
     mut transport: Box<dyn Transport>,

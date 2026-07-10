@@ -27,6 +27,9 @@ commands:
   send <addr> <sats>    send a plain payment (e.g. fund a peer)
   set <key> <value>     set config (stake_percent, auto_accept, auto_accept_cap_sats)
   config                show config
+  recover               list persisted bets and what each needs after a crash
+  recover <id>          drive a bet's recovery (settle / claim / reclaim)
+  recover <id> refund   broadcast that bet's refund
   help                  this help
   quit | exit           shut down";
 
@@ -163,6 +166,15 @@ pub fn parse(line: &str) -> std::result::Result<Option<Command>, String> {
             need(0)?;
             Command::ShowConfig
         }
+        // recover              → list persisted bets + what each needs
+        // recover <id>         → drive that bet's recovery (settle / claim / reclaim)
+        // recover <id> refund  → broadcast its refund
+        "recover" => match rest.len() {
+            0 => Command::Recover { id: None, refund: false },
+            1 => Command::Recover { id: Some(rest[0].to_string()), refund: false },
+            2 if rest[1] == "refund" => Command::Recover { id: Some(rest[0].to_string()), refund: true },
+            _ => return Err("usage: recover [<id> [refund]]".into()),
+        },
         "quit" | "exit" => Command::Quit,
         other => return Err(format!("unknown command '{other}' (try 'help')")),
     };

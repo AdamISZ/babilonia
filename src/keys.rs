@@ -4,9 +4,10 @@
 
 use rand::RngCore;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use serde::{Deserialize, Serialize};
 
 /// A secret/public keypair on secp256k1.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Keypair {
     pub sk: SecretKey,
     pub pk: PublicKey,

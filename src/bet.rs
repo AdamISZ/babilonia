@@ -24,6 +24,7 @@ use crate::musig::{adapt, extract, signature_bytes};
 use crate::reveal::{claim_secret, recover_a_c, won};
 use crate::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams, SetupResult};
 use crate::transport::Transport;
+use crate::persist::{new_id, BetRecord, Phase, SetupData};
 use crate::txgraph::{build_claim_spend, key_spend_sighash, script_spend_sighash, ClaimOutput, TaprootKey};
 use crate::wallet::Wallet;
 use crate::{Error, Result};
@@ -32,6 +33,7 @@ use crate::{Error, Result};
 const FUND_FEE: Amount = Amount::from_sat(1_000);
 
 /// The party's role and its private inputs.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum BetRole {
     Dealer(AliceSecrets),
     Player(BobSecrets),
@@ -50,7 +52,9 @@ pub struct Bet<T: Transport> {
     recovered_a_c: Option<Scalar>,
     funding_tx: Option<Transaction>,
     progress: Option<Box<dyn Fn(&str) + Send>>,
-    /// Where the fully-signed refund is persisted before funding is broadcast (recovery on abort).
+    /// Unique id for this bet's on-disk record.
+    bet_id: String,
+    /// Where the crash-recovery record + refund are persisted (recovery for either party).
     state_dir: Option<PathBuf>,
 }
 
@@ -75,6 +79,7 @@ impl<T: Transport> Bet<T> {
             recovered_a_c: None,
             funding_tx: None,
             progress: None,
+            bet_id: new_id(),
             state_dir: None,
         }
     }
@@ -128,6 +133,37 @@ impl<T: Transport> Bet<T> {
         let path = dir.join(format!("refund-{}.txt", self.params.u1_outpoint.txid));
         std::fs::write(&path, record)?;
         self.log(&format!("refund persisted → {} (broadcast after block {lock} to reclaim)", path.display()));
+        Ok(())
+    }
+
+    /// Snapshot the full bet state to disk at a phase transition, so either party can complete or
+    /// recover *any* step after a crash. No-op without a state dir. Written atomically.
+    fn persist(&self, phase: Phase) -> Result<()> {
+        let Some(dir) = &self.state_dir else {
+            return Ok(());
+        };
+        let setup = self.setup.as_ref().map(|s| SetupData {
+            settle_tx: s.settle_tx.clone(),
+            settle_pre: s.settle_pre.clone(),
+            refund_tx: s.refund_tx.clone(),
+            refund_sig: s.refund_sig.clone(),
+            ctxt: s.ctxt,
+            d_point: s.d_point,
+            k: s.k,
+            thimbles: s.thimbles,
+            p_a: s.p_a,
+        });
+        let record = BetRecord {
+            id: self.bet_id.clone(),
+            phase,
+            role: self.role.clone(),
+            params: self.params.clone(),
+            funding_tx: self.funding_tx.clone(),
+            setup,
+            recovered_a_c: self.recovered_a_c,
+        };
+        record.save(dir)?;
+        self.log(&format!("bet {} state persisted (phase {phase:?})", &self.bet_id[..8.min(self.bet_id.len())]));
         Ok(())
     }
 
@@ -298,6 +334,7 @@ impl<T: Transport> Bet<T> {
             .ok_or(Error::Protocol("could not extract d from settlement"))?;
         let a_c = recover_a_c(self.params.pi_a_scheme, &ctxt, &d)?;
         self.recovered_a_c = Some(a_c);
+        self.persist(Phase::Observed)?;
         let outcome = if won(&a_c, &thimbles[guess]) { Outcome::PlayerWins } else { Outcome::DealerWins };
         self.log(&format!("extracted d, decrypted a_c → {outcome:?}"));
         Ok(outcome)
@@ -418,6 +455,7 @@ impl<T: Transport> BetChain for Bet<T> {
         self.log(&format!("joint PSBT funding built — U1 = {u1_out} ({} sat); TX1 held (not broadcast)", u1_value.to_sat()));
         self.log(&self.decode_tx(&tx, "TX1 (joint funding, both inputs signed)"));
         self.funding_tx = Some(tx);
+        self.persist(Phase::Funded)?;
         Ok(())
     }
 
@@ -429,6 +467,7 @@ impl<T: Transport> BetChain for Bet<T> {
         // may spend U1 before the other party's check runs.
         self.wait_confirmed(txid, 1)?;
         self.log(&format!("funding TX1 broadcast + confirmed ({txid})"));
+        self.persist(Phase::FundingBroadcast)?;
         Ok(())
     }
 
@@ -441,6 +480,7 @@ impl<T: Transport> BetChain for Bet<T> {
         self.setup = Some(result);
         self.log("setup complete — refund and settlement adaptor pre-signed");
         self.persist_refund()?; // safety net on disk BEFORE any funding is broadcast
+        self.persist(Phase::SetupDone)?;
         Ok(())
     }
 
@@ -457,12 +497,17 @@ impl<T: Transport> BetChain for Bet<T> {
         let txid = self.chain.broadcast(&tx)?;
         self.wait_confirmed(txid, 1)?;
         self.log(&format!("settled — adapted with d and broadcast {txid} (d now on-chain)"));
+        self.persist(Phase::Settled)?;
         Ok(())
     }
 
     fn observe_outcome(&mut self) -> Result<Outcome> {
         match &self.role {
-            BetRole::Dealer(_) => self.dealer_observe(),
+            BetRole::Dealer(_) => {
+                let outcome = self.dealer_observe()?;
+                self.persist(Phase::Done)?; // dealer's terminal step (the player's Done is in claim_win)
+                Ok(outcome)
+            }
             BetRole::Player(p) => {
                 let guess = p.guess;
                 self.player_observe(guess)
@@ -488,7 +533,9 @@ impl<T: Transport> BetChain for Bet<T> {
         let tweaked = BKeypair::from_secret_key(&bsecp, &sk).tap_tweak(&bsecp, claim.spend_info.merkle_root());
         let sig = bsecp.sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &tweaked.to_keypair()).serialize();
         tx.input[0].witness = Witness::from_slice(&[sig.as_slice()]);
-        self.submit_claim(&tx, "claim (Bob wins — key-path spend of K)", "<K> key path")
+        self.submit_claim(&tx, "claim (Bob wins — key-path spend of K)", "<K> key path")?;
+        self.persist(Phase::Done)?;
+        Ok(())
     }
 
     fn dealer_take_on_loss(&mut self) -> Result<()> {
