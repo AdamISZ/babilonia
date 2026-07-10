@@ -19,6 +19,14 @@ use bitcoincore_rpc::{Client, RpcApi};
 use super::Transport;
 use crate::{Error, Result};
 
+/// Magic prefix stamped on every babilonia frame *inside* its decoy payload, so a receiver can tell
+/// our traffic apart from the generic BIP324 decoy packets any v2 node may emit (that indistinction
+/// is what let a random signet peer hijack the accepter's peer slot). It rides inside the
+/// AEAD-encrypted decoy content, so it's invisible on the wire — no covertness cost. The trailing
+/// byte is a version. NOTE: this only marks a frame as *babilonia*; it does not authenticate *which*
+/// counterparty sent it — per-session rendezvous (a shared token) is the follow-on for that.
+pub const DECOY_MAGIC: &[u8] = b"babilon\x01";
+
 /// A [`Transport`] that tunnels frames as BIP324 decoy packets to one peer, driven over a local
 /// (patched) `bitcoind`'s `senddecoy`/`getdecoys` RPCs.
 pub struct Bip324Transport {
@@ -53,14 +61,25 @@ impl Bip324Transport {
         self
     }
 
-    /// Pull any decoys received from the peer into the inbox.
+    /// Pre-seed the inbox with frames already pulled from `getdecoys` during peer identification.
+    /// `getdecoys` drains, so a caller that read decoys to discover *which* peer is running the
+    /// protocol (the accepter side) must hand those frames here, or the first message is lost.
+    pub fn seeded(mut self, frames: Vec<Vec<u8>>) -> Self {
+        self.inbox.extend(frames);
+        self
+    }
+
+    /// Pull any decoys received from the peer into the inbox — keeping only *our* frames (those
+    /// carrying [`DECOY_MAGIC`]) and dropping generic BIP324 decoys the peer may also emit.
     fn drain_decoys(&mut self) -> Result<()> {
         let r: serde_json::Value = self.client.call("getdecoys", &[self.peer_id.into()])?;
         if let Some(arr) = r.as_array() {
             for v in arr {
                 if let Some(s) = v.as_str() {
                     let bytes = hex::decode(s).map_err(|_| Error::Transport("bad decoy hex"))?;
-                    self.inbox.push_back(bytes);
+                    if let Some(frame) = bytes.strip_prefix(DECOY_MAGIC) {
+                        self.inbox.push_back(frame.to_vec());
+                    }
                 }
             }
         }
@@ -70,9 +89,10 @@ impl Bip324Transport {
 
 impl Transport for Bip324Transport {
     fn send(&mut self, frame: &[u8]) -> Result<()> {
+        let payload = [DECOY_MAGIC, frame].concat(); // mark it as ours
         let queued: serde_json::Value = self
             .client
-            .call("senddecoy", &[self.peer_id.into(), hex::encode(frame).into()])?;
+            .call("senddecoy", &[self.peer_id.into(), hex::encode(&payload).into()])?;
         if queued.as_bool() == Some(true) {
             Ok(())
         } else {

@@ -9,10 +9,12 @@
 //! default. Run **serially** — each test spawns two mining nodes, so parallel runs contend:
 //!   cargo test --test bip324 -- --ignored --test-threads=1 --nocapture
 
+use babilonia::agent::{Backend, RpcBackend};
 use babilonia::keys::Keypair;
 use babilonia::node::Node;
 use babilonia::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams};
 use babilonia::transport::{bip324::Bip324Transport, Transport};
+use bitcoin::Network;
 use musig2::secp::Scalar;
 use secp256k1::Secp256k1;
 use std::time::{Duration, Instant};
@@ -104,6 +106,54 @@ fn decoy_round_trip_over_v2() {
     // Draining is exhaustive: a second read returns nothing.
     assert!(b.get_decoys(a_id_on_b).unwrap().is_empty(), "decoys drained on read");
     println!("[ok]   decoys exchanged over BIP324 v2, each side reads the other's payload ✓");
+}
+
+/// Peer identification — the crux of running on a **public** network, where a node has many v2
+/// peers. `accept` must register the *right* one and never a silent bystander: the dialer matches by
+/// the address it dialed; the accepter matches the peer that sends a decoy (our protocol — a normal
+/// peer sends none) and seeds the drained frame so the first message isn't lost.
+#[test]
+#[ignore = "requires the patched bitcoind build; run with --ignored"]
+fn accept_identifies_the_right_peer() {
+    let bin = patched_bitcoind();
+    let a = Node::regtest_with_binary(&bin).expect("patched node A");
+    let b = Node::regtest_with_binary(&bin).expect("patched node B");
+    b.connect_to(&a).expect("addnode");
+    assert!(a.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "A sees v2 peer");
+    assert!(b.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "B on v2");
+
+    let backend = |n: &Node| {
+        RpcBackend::new(n.rpc_url().to_string(), n.cookie().to_path_buf(), Network::Regtest, "bab".into())
+    };
+    let (backend_a, backend_b) = (backend(&a), backend(&b));
+
+    // Dialer side (B dialed A): register the peer at the dialed address — and *only* that address.
+    let a_addr = a.p2p_addr();
+    assert!(backend_b.accept(Some(a_addr.as_str())).unwrap().is_some(), "B registers A by dialed addr");
+    assert!(backend_b.accept(Some("10.255.255.1:1")).unwrap().is_none(), "no peer at a bogus addr");
+
+    // Accepter side (A): a silent v2 peer is NOT registered — this is the old 'first v2 peer' bug that
+    // would grab a random signet node.
+    assert!(backend_a.accept(None).unwrap().is_none(), "A ignores a peer that has sent no decoy");
+
+    // A *generic* BIP324 decoy (no babilonia magic) must be ignored — this is the signet bug, where a
+    // random v2 node's decoy hijacked the accepter's slot. Send one, then our real (magic) hello.
+    let b_id = b.only_peer_id().unwrap();
+    b.send_decoy(b_id, b"generic padding, not ours").expect("raw decoy");
+    let mut tb = Bip324Transport::new(b.new_rpc_client().unwrap(), b_id);
+    tb.send(&[0u8]).expect("B sends a hello decoy");
+    let mut transport = (0..100)
+        .find_map(|_| match backend_a.accept(None) {
+            Ok(Some((t, _))) => Some(t),
+            _ => {
+                std::thread::sleep(Duration::from_millis(100));
+                None
+            }
+        })
+        .expect("A identifies B once it sends a *babilonia* decoy");
+    // The generic decoy was dropped (else it would seed/return first); only the magic hello survives.
+    assert_eq!(transport.recv().unwrap(), vec![0u8], "generic decoy ignored, hello frame seeded");
+    println!("[ok]   accept: dialer matches by addr, accepter identifies by decoy + seeds ✓");
 }
 
 /// Peer two patched nodes and hand each side a `Bip324Transport`.

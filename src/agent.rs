@@ -240,11 +240,13 @@ pub trait Backend: Send + Sync {
     fn dial(&self, _addr: &str) -> Result<()> {
         Ok(())
     }
-    /// If the node has an established v2 peer, return a transport to it together with its address.
-    /// The core polls this while it holds no registered peer and registers the first one that
-    /// appears — so a node auto-accepts an inbound connection with no user action. Default: `None`
-    /// (backends with no peer discovery, e.g. the in-memory test transport).
-    fn accept(&self) -> Result<Option<(Box<dyn Transport>, String)>> {
+    /// Identify the counterparty peer and return a transport to it (with its address). The core polls
+    /// this while it holds no registered peer. `expected` disambiguates on a busy node with many v2
+    /// peers (e.g. a signet/mainnet node): `Some(addr)` — *we* dialed that address, so match the peer
+    /// with it (dialer side); `None` — match the peer that is actually exchanging **decoys**, i.e. the
+    /// one running our protocol (a normal network peer never sends decoys) (accepter side). Default:
+    /// `None` (backends with no peer discovery, e.g. the in-memory test transport).
+    fn accept(&self, _expected: Option<&str>) -> Result<Option<(Box<dyn Transport>, String)>> {
         Ok(None)
     }
 }
@@ -307,6 +309,10 @@ impl ProposeTerms {
     }
 }
 
+/// Presence marker a dialer sends once on connect so the accepter can identify which of its v2 peers
+/// is running our protocol (a decoy = our protocol; normal peers send none). `ProposeTerms::decode`
+/// rejects it (tag ≠ 1), so a worker that receives it ignores it.
+const MSG_HELLO: &[u8] = &[0u8];
 const MSG_ACCEPT: &[u8] = &[2u8];
 const MSG_REJECT: &[u8] = &[3u8];
 
@@ -363,6 +369,9 @@ pub struct NodeCore {
     input_tx: Sender<Input>,
     input_rx: Receiver<Input>,
     peer: Option<PeerHandle>,
+    /// The address we dialed via [`Command::Connect`], if any. On a busy node it tells `accept` to
+    /// register the peer at *this* address (dialer side); `None` means match by decoy traffic.
+    dialed: Option<String>,
     pending: Option<(BetId, u64)>, // (id, stake) awaiting manual Accept/Reject
     next_bet_id: BetId,
 }
@@ -408,6 +417,7 @@ impl NodeCore {
             input_tx,
             input_rx,
             peer: None,
+            dialed: None,
             pending: None,
             next_bet_id: 1,
         };
@@ -435,7 +445,7 @@ impl NodeCore {
     /// Seed an already-established peer transport (used by tests / when a connection is made out of
     /// band). The real path is the [`Command::Connect`] handler.
     pub fn with_seeded_peer(mut self, addr: impl Into<String>, transport: Box<dyn Transport>) -> Self {
-        self.spawn_peer(addr.into(), transport);
+        self.spawn_peer(addr.into(), transport, false); // pre-established channel: no discovery hello
         self
     }
 
@@ -465,9 +475,12 @@ impl NodeCore {
     fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Connect { addr } => match self.backend.dial(&addr) {
-                Ok(()) => self.emit(Event::Info {
-                    msg: format!("dialing {addr}… (registers automatically once connected)"),
-                }),
+                Ok(()) => {
+                    self.emit(Event::Info {
+                        msg: format!("dialing {addr}… (registers automatically once connected)"),
+                    });
+                    self.dialed = Some(addr);
+                }
                 Err(e) => self.emit(Event::Error { msg: format!("dial: {e}") }),
             },
             Command::Propose => self.propose(),
@@ -576,19 +589,21 @@ impl NodeCore {
         if self.peer.is_some() {
             return;
         }
-        if let Ok(Some((transport, addr))) = self.backend.accept() {
-            self.spawn_peer(addr.clone(), transport);
+        if let Ok(Some((transport, addr))) = self.backend.accept(self.dialed.as_deref()) {
+            // Dialer (we have a `dialed` addr) announces itself; the accepter identified us by decoy.
+            let send_hello = self.dialed.is_some();
+            self.spawn_peer(addr.clone(), transport, send_hello);
             self.emit(Event::Connected { peer: addr });
         }
     }
 
-    fn spawn_peer(&mut self, addr: String, transport: Box<dyn Transport>) {
+    fn spawn_peer(&mut self, addr: String, transport: Box<dyn Transport>, send_hello: bool) {
         let (instr_tx, instr_rx) = channel::<Instr>();
         let to_core = self.input_tx.clone();
         let backend = self.backend.clone();
         let config = self.config.clone();
         let accept = self.accept_policy.clone();
-        thread::spawn(move || peer_worker(transport, instr_rx, to_core, backend, config, accept));
+        thread::spawn(move || peer_worker(transport, instr_rx, to_core, backend, config, accept, send_hello));
         self.peer = Some(PeerHandle { addr, instr: instr_tx });
     }
 }
@@ -605,7 +620,15 @@ fn peer_worker(
     backend: Arc<dyn Backend>,
     mut config: Config,
     accept: Arc<dyn AcceptPolicy>,
+    send_hello: bool,
 ) {
+    // Dialer only: announce presence with a hello decoy so the accepter can pick us out among its v2
+    // peers (it can't match us by address — we're inbound to it). The accepter stays silent: *we*
+    // already know it (the peer at the address we dialed), so it needs no hello — and a reply hello
+    // could collide with a protocol `recv()` (e.g. the proposer awaiting ACCEPT).
+    if send_hello {
+        let _ = transport.send(MSG_HELLO);
+    }
     let mut pending_terms: Option<ProposeTerms> = None;
     loop {
         // 1. Incoming control frame?
@@ -820,7 +843,7 @@ mod rpc_backend {
 
     use super::Backend;
     use crate::chain::RpcChain;
-    use crate::transport::bip324::Bip324Transport;
+    use crate::transport::bip324::{Bip324Transport, DECOY_MAGIC};
     use crate::transport::Transport;
     use crate::wallet::RpcWallet;
     use crate::Result;
@@ -864,20 +887,65 @@ mod rpc_backend {
             Ok(())
         }
 
-        fn accept(&self) -> Result<Option<(Box<dyn Transport>, String)>> {
+        fn accept(&self, expected: Option<&str>) -> Result<Option<(Box<dyn Transport>, String)>> {
             let c = self.client("")?;
             let peers: serde_json::Value = c.call("getpeerinfo", &[])?;
-            let peer = peers
+            let v2_peers = peers
                 .as_array()
-                .and_then(|arr| arr.iter().find(|p| p.get("transport_protocol_type").and_then(|t| t.as_str()) == Some("v2")));
-            if let Some(p) = peer {
-                if let Some(id) = p.get("id").and_then(|v| v.as_i64()) {
-                    let addr = p.get("addr").and_then(|a| a.as_str()).unwrap_or("peer").to_string();
-                    return Ok(Some((Box::new(Bip324Transport::new(self.client("")?, id)), addr)));
+                .into_iter()
+                .flatten()
+                .filter(|p| p.get("transport_protocol_type").and_then(|t| t.as_str()) == Some("v2"));
+
+            for p in v2_peers {
+                let Some(id) = p.get("id").and_then(|v| v.as_i64()) else { continue };
+                let addr = p.get("addr").and_then(|a| a.as_str()).unwrap_or("peer").to_string();
+                match expected {
+                    // Dialer: register the peer at the address we dialed (there may be many others).
+                    Some(want) => {
+                        if addr_matches(&addr, want) {
+                            return Ok(Some((Box::new(Bip324Transport::new(self.client("")?, id)), addr)));
+                        }
+                    }
+                    // Accepter: register the peer that is actually sending us decoys — our protocol's
+                    // hello. A normal network peer never does. `getdecoys` drains, so hand the drained
+                    // frames to the transport so nothing sent before registration is lost.
+                    None => {
+                        let seed = drain_decoys(&c, id);
+                        if !seed.is_empty() {
+                            let t = Bip324Transport::new(self.client("")?, id).seeded(seed);
+                            return Ok(Some((Box::new(t), addr)));
+                        }
+                    }
                 }
             }
             Ok(None)
         }
+    }
+
+    /// Does a `getpeerinfo` peer address match the address we dialed? Exact, or same host (a dialed
+    /// `ip:port` shows back verbatim for an outbound peer; be lenient on port formatting).
+    fn addr_matches(peer_addr: &str, want: &str) -> bool {
+        fn host(a: &str) -> &str {
+            a.rsplit_once(':').map(|(h, _)| h).unwrap_or(a)
+        }
+        peer_addr == want || host(peer_addr) == host(want)
+    }
+
+    /// Drain `getdecoys` for one peer into decoded frames — tolerant: a peer with no decoy session
+    /// (a normal network peer) yields an empty vec rather than erroring, so we can probe every peer.
+    fn drain_decoys(c: &Client, id: i64) -> Vec<Vec<u8>> {
+        let Ok(r) = c.call::<serde_json::Value>("getdecoys", &[id.into()]) else {
+            return Vec::new();
+        };
+        r.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .filter_map(|s| hex::decode(s).ok())
+            // Only *babilonia* frames (magic prefix) identify a peer as ours; a generic BIP324 decoy
+            // from a random v2 peer must not register it (the signet peer-hijack bug).
+            .filter_map(|bytes| bytes.strip_prefix(DECOY_MAGIC).map(|f| f.to_vec()))
+            .collect()
     }
 
     /// A [`Backend`] whose wallet is the standalone **`basic-wallet`** (BDK): keys live in the app and
@@ -923,8 +991,8 @@ mod rpc_backend {
             self.inner.dial(addr)
         }
 
-        fn accept(&self) -> Result<Option<(Box<dyn Transport>, String)>> {
-            self.inner.accept()
+        fn accept(&self, expected: Option<&str>) -> Result<Option<(Box<dyn Transport>, String)>> {
+            self.inner.accept(expected)
         }
     }
 }
