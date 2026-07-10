@@ -883,8 +883,14 @@ mod rpc_backend {
 
         fn dial(&self, addr: &str) -> Result<()> {
             let c = self.client("")?;
-            let _: serde_json::Value = c.call("addnode", &[addr.into(), "add".into()])?;
-            Ok(())
+            // "add" registers a persistent peer. If it's already added (a re-`connect`, or the node
+            // dialed it during normal peering), that's success — the peer is there — not a failure;
+            // the caller must still proceed as the dialer (set `dialed`, send the hello).
+            match c.call::<serde_json::Value>("addnode", &[addr.into(), "add".into()]) {
+                Ok(_) => Ok(()),
+                Err(e) if e.to_string().contains("already added") => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         }
 
         fn accept(&self, expected: Option<&str>) -> Result<Option<(Box<dyn Transport>, String)>> {

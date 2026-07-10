@@ -127,8 +127,13 @@ fn accept_identifies_the_right_peer() {
     };
     let (backend_a, backend_b) = (backend(&a), backend(&b));
 
-    // Dialer side (B dialed A): register the peer at the dialed address — and *only* that address.
+    // A re-`dial` of an already-added peer must be tolerated, not error — else the dialer never
+    // proceeds to set `dialed` / send its hello (the "node already added" bug).
     let a_addr = a.p2p_addr();
+    backend_b.dial(&a_addr).expect("dial");
+    backend_b.dial(&a_addr).expect("re-dial of an already-added peer is tolerated");
+
+    // Dialer side (B dialed A): register the peer at the dialed address — and *only* that address.
     assert!(backend_b.accept(Some(a_addr.as_str())).unwrap().is_some(), "B registers A by dialed addr");
     assert!(backend_b.accept(Some("10.255.255.1:1")).unwrap().is_none(), "no peer at a bogus addr");
 
