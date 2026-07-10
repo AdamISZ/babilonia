@@ -312,6 +312,8 @@ impl ProposeTerms {
             refund_locktime: self.refund_locktime,
             alice_timeout: self.alice_timeout,
             pi_a_scheme: self.scheme(),
+            alice_payout: String::new(), // filled by fund_pot from the funding flights
+            bob_payout: String::new(),
         }
     }
 }

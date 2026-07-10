@@ -46,6 +46,8 @@ fn params() -> GameParams {
         refund_locktime: REFUND_LOCKTIME,
         alice_timeout: ALICE_TIMEOUT,
         pi_a_scheme: babilonia::pi_a::Scheme::Squaring,
+        alice_payout: String::new(), // filled by fund_pot
+        bob_payout: String::new(),
     }
 }
 

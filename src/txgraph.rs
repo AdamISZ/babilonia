@@ -142,6 +142,24 @@ pub fn build_claim_spend(claim: OutPoint, sequence: Sequence, outputs: Vec<TxOut
     spend_inputs(&[(claim, sequence)], outputs, LockTime::ZERO)
 }
 
+/// The dust threshold used for the payment-manifold outputs (a taproot output's minimum).
+pub const DUST: Amount = Amount::from_sat(330);
+
+/// Split `total` into a payment + change pair for a payment-like 2-out spend (COVERT-TX-PLAN §8.2):
+/// `pay + change = total`, both **≥ dust** and **unequal** (equal outputs are a coinjoin tell). The
+/// minority third goes to change; the payment gets the rest.
+pub fn split_payment(total: Amount) -> Result<(Amount, Amount)> {
+    let change = Amount::from_sat(total.to_sat() / 3);
+    let pay = total.checked_sub(change).ok_or(Error::Protocol("claim total underflow"))?;
+    if change < DUST {
+        return Err(Error::Protocol("claim too small to split into two non-dust outputs"));
+    }
+    if pay == change {
+        return Err(Error::Protocol("2-out split produced two equal outputs"));
+    }
+    Ok((pay, change))
+}
+
 /// The taproot **key-path** signature hash (BIP341, `SIGHASH_DEFAULT`) for `input_index`, given
 /// all prevouts. Used for the MuSig2 spends of `U1`.
 pub fn key_spend_sighash(tx: &Transaction, input_index: usize, prevouts: &[TxOut]) -> Result<[u8; 32]> {

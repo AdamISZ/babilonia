@@ -48,6 +48,11 @@ pub struct SetupData {
     pub k: Point,
     pub thimbles: [Point; 2],
     pub p_a: Point,
+    /// Dealer only: the pre-signed 2-out CSV-leaf reclaim of `O_K` (enforced Alice-win). Valid only
+    /// after the relative timelock `t_1`; built + witnessed at setup so recovery just broadcasts it.
+    /// `None` for the player. See COVERT-TX-PLAN §8.
+    #[serde(default)]
+    pub reclaim_tx: Option<Transaction>,
 }
 
 /// The full recoverable state of one party's bet.

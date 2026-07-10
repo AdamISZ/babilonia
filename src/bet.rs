@@ -25,7 +25,7 @@ use crate::reveal::{claim_secret, recover_a_c, won};
 use crate::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams, SetupResult};
 use crate::transport::Transport;
 use crate::persist::{new_id, BetRecord, Phase, SetupData};
-use crate::txgraph::{build_claim_spend, key_spend_sighash, script_spend_sighash, ClaimOutput, TaprootKey};
+use crate::txgraph::{build_claim_spend, key_spend_sighash, script_spend_sighash, split_payment, ClaimOutput, TaprootKey};
 use crate::wallet::Wallet;
 use crate::{Error, Result};
 
@@ -52,6 +52,8 @@ pub struct Bet<T: Transport> {
     setup: Option<SetupResult>,
     recovered_a_c: Option<Scalar>,
     funding_tx: Option<Transaction>,
+    /// Dealer only: the pre-signed 2-out CSV-leaf reclaim of `O_K`, built at setup and persisted.
+    reclaim_tx: Option<Transaction>,
     progress: Option<Box<dyn Fn(&str) + Send>>,
     /// Unique id for this bet's on-disk record.
     bet_id: String,
@@ -60,6 +62,31 @@ pub struct Bet<T: Transport> {
 }
 
 impl<T: Transport> Bet<T> {
+    /// Funding amounts (Alice-parks, COVERT-TX-PLAN §8.2): `U1 = F_A + b − fee` (Alice bears the
+    /// funding fee), Bob's change `c_B = F_B − b`.
+    fn funding_amounts(f_a: Amount, f_b: Amount, b: Amount, fee: Amount) -> Result<(Amount, Amount)> {
+        let u1_value = f_a
+            .checked_add(b)
+            .and_then(|v| v.checked_sub(fee))
+            .ok_or(Error::Protocol("funding amount underflow"))?;
+        let c_b = f_b.checked_sub(b).ok_or(Error::Protocol("player input below stake"))?;
+        Ok((u1_value, c_b))
+    }
+
+    /// Guard the parked surplus before broadcasting: `c_A = U1 − S ≥ 5·fee`, and the settlement's two
+    /// outputs must differ (`c_A_out = c_A − fee ≠ S`). Protects covertness and dust.
+    fn check_park(u1_value: Amount, a: Amount, b: Amount, fee: Amount) -> Result<()> {
+        let s = a + b;
+        let c_a = u1_value.checked_sub(s).ok_or(Error::Protocol("pot below stake — dealer input too small"))?;
+        if c_a < Amount::from_sat(5 * fee.to_sat()) {
+            return Err(Error::Protocol("parked surplus below 5·fee floor — dealer input too small"));
+        }
+        if c_a.checked_sub(fee) == Some(s) {
+            return Err(Error::Protocol("settlement would have two equal outputs (c_A_out == S)"));
+        }
+        Ok(())
+    }
+
     /// Construct a bet for `role` over `wallet`/`chain`/`transport`.
     pub fn new(
         wallet: Box<dyn Wallet>,
@@ -79,6 +106,7 @@ impl<T: Transport> Bet<T> {
             setup: None,
             recovered_a_c: None,
             funding_tx: None,
+            reclaim_tx: None,
             progress: None,
             bet_id: new_id(),
             state_dir: None,
@@ -153,6 +181,7 @@ impl<T: Transport> Bet<T> {
             k: s.k,
             thimbles: s.thimbles,
             p_a: s.p_a,
+            reclaim_tx: self.reclaim_tx.clone(),
         });
         let record = BetRecord {
             id: self.bet_id.clone(),
@@ -228,32 +257,30 @@ impl<T: Transport> Bet<T> {
         Ok((u1, addr.to_string()))
     }
 
-    /// Build the shared unsigned funding PSBT (both sides build it identically): inputs in order
-    /// `[dealer, player]`, outputs `[U1:pot, dealer_change, player_change]`. The output *layout* is
-    /// protocol logic; the PSBT construction goes through the [`Wallet`].
+    /// Build the **2-in / 2-out** funding PSBT (Alice-parks, COVERT-TX-PLAN §8): inputs `[F_A, F_B]`,
+    /// outputs `[U1(value), Bob's change]`. Alice's whole input folds into `U1` (no Alice change) —
+    /// the payjoin shape. The layout is protocol logic; the PSBT goes through the [`Wallet`].
     fn build_funding_psbt(
         &self,
         inputs: [OutPoint; 2],
         u1_addr: &str,
-        pot: Amount,
-        changes: [(String, Amount); 2],
+        u1_value: Amount,
+        bob_change: (&str, Amount),
     ) -> Result<String> {
-        let [(d_addr, d_amt), (p_addr, p_amt)] = changes;
-        let outputs = [(u1_addr.to_string(), pot), (d_addr, d_amt), (p_addr, p_amt)];
+        let outputs = [(u1_addr.to_string(), u1_value), (bob_change.0.to_string(), bob_change.1)];
         self.wallet.create_psbt(&inputs, &outputs)
     }
 
     /// The dealer verifies the player-built funding tx before co-signing: it must spend exactly the
-    /// two agreed inputs and pay exactly U1 (the pot) plus both changes — nothing more, so the
-    /// player cannot redirect or over-fee the dealer's stake. Order-independent (the player's wallet
-    /// chose the layout).
+    /// two agreed inputs and pay exactly `U1` (value `F_A + b − fee`) + Bob's change — nothing more, so
+    /// the player cannot redirect or over-fee Alice's parked input. Order-independent.
     fn verify_funding_psbt(
         &self,
         psbt_b64: &str,
         inputs: [OutPoint; 2],
         u1: &TaprootKey,
-        pot: Amount,
-        changes: [(&str, Amount); 2],
+        u1_value: Amount,
+        bob_change: (&str, Amount),
     ) -> Result<()> {
         let psbt = bitcoin::Psbt::from_str(psbt_b64).map_err(|_| Error::Decode("funding psbt"))?;
         let tx = &psbt.unsigned_tx;
@@ -275,9 +302,8 @@ impl<T: Transport> Bet<T> {
                 .to_bytes())
         };
         let mut want_out = vec![
-            (u1.spk.to_bytes(), pot.to_sat()),
-            (spk_of(changes[0].0)?, changes[0].1.to_sat()),
-            (spk_of(changes[1].0)?, changes[1].1.to_sat()),
+            (u1.spk.to_bytes(), u1_value.to_sat()),
+            (spk_of(bob_change.0)?, bob_change.1.to_sat()),
         ];
         let mut got_out: Vec<(Vec<u8>, u64)> =
             tx.output.iter().map(|o| (o.script_pubkey.to_bytes(), o.value.to_sat())).collect();
@@ -309,12 +335,10 @@ impl<T: Transport> Bet<T> {
         Ok(self.state()?.settle_tx.compute_txid())
     }
 
-    /// Value carried by the settlement output (= claim-output prevout).
+    /// Value carried by the settlement's claim output `O_K` — the at-risk pot `S = a + b` (Alice's
+    /// parked `c_A` returns as the settlement's *other* output, not through `O_K`).
     fn pot(&self) -> Result<Amount> {
-        self.params
-            .u1_value
-            .checked_sub(self.params.fee)
-            .ok_or(Error::Protocol("fee exceeds pot"))
+        Ok(self.params.alice_stake + self.params.bob_stake)
     }
 
     // --- role-specific observation ---
@@ -360,19 +384,45 @@ impl<T: Transport> Bet<T> {
         }
     }
 
-    /// Build the unsigned claim-output spend paying the pot (minus fee) to a fresh wallet address.
+    /// Build the unsigned claim-output spend of `O_K` as a payment-like **2-out** tx (pay + change to
+    /// two fresh wallet addresses, summing `S − fee`; COVERT-TX-PLAN §8.2).
     fn build_claim_spend_tx(&self, sequence: Sequence) -> Result<(Transaction, Amount, ClaimOutput)> {
         let claim = self.claim_output()?;
-        let pot = self.pot()?;
+        let pot = self.pot()?; // O_K value = S
         let claim_out = OutPoint { txid: self.settle_txid()?, vout: 0 };
-        let dest = self.wallet.receive_address()?;
         let out_value = pot.checked_sub(self.params.fee).ok_or(Error::Protocol("fee exceeds claim"))?;
+        let (pay, change) = split_payment(out_value)?;
+        let pay_addr = self.wallet.receive_address()?;
+        let change_addr = self.wallet.change_address()?;
         let tx = build_claim_spend(
             claim_out,
             sequence,
-            vec![TxOut { value: out_value, script_pubkey: dest.script_pubkey() }],
+            vec![
+                TxOut { value: pay, script_pubkey: pay_addr.script_pubkey() },
+                TxOut { value: change, script_pubkey: change_addr.script_pubkey() },
+            ],
         );
         Ok((tx, pot, claim))
+    }
+
+    /// Dealer: build the fully-witnessed **2-out** CSV-leaf reclaim of `O_K` (enforced Alice-win). A
+    /// script-path spend of Alice's timeout leaf, sequence `t_1` — valid only after the relative
+    /// timelock, so it can be pre-signed at setup. Payment-shaped (pay + change to two Alice addrs).
+    fn build_reclaim_tx(&self) -> Result<Transaction> {
+        let sk_a = match &self.role {
+            BetRole::Dealer(a) => Scalar::from(a.identity.sk),
+            BetRole::Player(_) => return Err(Error::Protocol("only the dealer reclaims")),
+        };
+        let (mut tx, pot, claim) = self.build_claim_spend_tx(Sequence::from_height(self.params.alice_timeout))?;
+        let sighash = script_spend_sighash(&tx, 0, &[claim.txout(pot)], &claim.alice_leaf)?;
+        let bsecp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = SecretKey::from_slice(&sk_a.serialize()).map_err(|_| Error::Protocol("bad key"))?;
+        let sig = bsecp
+            .sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &BKeypair::from_secret_key(&bsecp, &sk))
+            .serialize();
+        let cb = claim.control_block(&claim.alice_leaf)?;
+        tx.input[0].witness = Witness::from_slice(&[sig.as_slice(), claim.alice_leaf.as_bytes(), &cb.serialize()]);
+        Ok(tx)
     }
 
     /// Broadcast a fully-witnessed claim spend, wait for confirmation, and log it.
@@ -387,74 +437,66 @@ impl<T: Transport> Bet<T> {
 
 impl<T: Transport> BetChain for Bet<T> {
     fn fund_pot(&mut self) -> Result<()> {
-        let (alice_stake, bob_stake) = (self.params.alice_stake, self.params.bob_stake);
-        let pot = alice_stake + bob_stake;
-        let half_fee = Amount::from_sat(self.params.fee.to_sat() / 2);
+        let (a, b, fee) = (self.params.alice_stake, self.params.bob_stake, self.params.fee);
+        // Alice brings a whole input F_A ≥ a + 6·fee so the parked c_A clears the 5·fee floor.
+        let alice_need = a + Amount::from_sat(6 * fee.to_sat());
 
-        // Extract our funding pubkey (drop the `self.role` borrow before the &mut coordination).
         enum Side {
             Dealer,
             Player,
         }
         let (side, my_key) = match &self.role {
-            BetRole::Dealer(a) => (Side::Dealer, a.identity.pk),
-            BetRole::Player(b) => (Side::Player, b.funding.pk),
-        };
-        let change_of = |amount: Amount, stake: Amount| -> Result<Amount> {
-            amount
-                .checked_sub(stake)
-                .and_then(|a| a.checked_sub(half_fee))
-                .ok_or(Error::Protocol("funding input too small for stake"))
+            BetRole::Dealer(s) => (Side::Dealer, s.identity.pk),
+            BetRole::Player(s) => (Side::Player, s.funding.pk),
         };
 
-        // **Player builds** the whole funding tx (its wallet's natural shape) and signs its own
-        // input; the **dealer respects it** — verifying it pays exactly what was agreed, then adding
-        // its own signature. One wallet decides the transaction layout; babilonia never re-orders it.
+        // **Player builds** the 2-in/2-out payjoin funding; the **dealer verifies + co-signs**. Alice
+        // parks (whole input into U1, no funding change); Bob takes his change. See COVERT-TX-PLAN §8.
         let (u1, tx) = match side {
             Side::Dealer => {
-                let (input, amount) = self.wallet.select_input(alice_stake + half_fee)?;
-                let change = self.wallet.change_address()?.to_string();
+                let (input, f_a) = self.wallet.select_input(alice_need)?; // F_A (whole; parked = F_A − a − fee)
+                let alice_payout = self.wallet.receive_address()?.to_string();
                 self.transport.send(
-                    &FundOpen { p_a: my_key.into(), input, amount: amount.to_sat(), change: change.clone() }.encode(),
+                    &FundOpen { p_a: my_key.into(), input, amount: f_a.to_sat(), alice_payout: alice_payout.clone() }.encode(),
                 )?;
                 let reply = FundReply::decode(&self.transport.recv()?)?;
                 let p_b: secp256k1::PublicKey = reply.p_b.into();
                 let (u1, _u1_addr) = self.u1_taproot(&my_key, &p_b)?;
-                // Verify the player's tx before co-signing our own input.
-                let changes = [
-                    (change.as_str(), change_of(amount, alice_stake)?),
-                    (reply.change.as_str(), change_of(Amount::from_sat(reply.amount), bob_stake)?),
-                ];
-                self.verify_funding_psbt(&reply.psbt, [input, reply.input], &u1, pot, changes)?;
+                let (u1_value, c_b) = Self::funding_amounts(f_a, Amount::from_sat(reply.amount), b, fee)?;
+                Self::check_park(u1_value, a, b, fee)?;
+                self.verify_funding_psbt(&reply.psbt, [input, reply.input], &u1, u1_value, (&reply.change, c_b))?;
                 let both = self.wallet.sign_psbt(&reply.psbt)?; // add our input's signature
                 self.transport.send(&FundFinal { psbt: both.clone() }.encode())?;
-                (u1, self.wallet.combine_finalize(&[&both])?) // finalise the fully-signed psbt
+                self.params.alice_payout = alice_payout;
+                self.params.bob_payout = reply.bob_payout;
+                (u1, self.wallet.combine_finalize(&[&both])?)
             }
             Side::Player => {
                 let open = FundOpen::decode(&self.transport.recv()?)?;
                 let p_a: secp256k1::PublicKey = open.p_a.into();
                 let (u1, u1_addr) = self.u1_taproot(&p_a, &my_key)?;
-                let (input, amount) = self.wallet.select_input(bob_stake + half_fee)?;
+                let (input, f_b) = self.wallet.select_input(b + fee)?; // F_B ≥ b + fee ⇒ non-dust change
                 let change = self.wallet.change_address()?.to_string();
-                let changes = [
-                    (open.change, change_of(Amount::from_sat(open.amount), alice_stake)?),
-                    (change.clone(), change_of(amount, bob_stake)?),
-                ];
-                let psbt = self.build_funding_psbt([open.input, input], &u1_addr, pot, changes)?;
+                let bob_payout = self.wallet.receive_address()?.to_string();
+                let (u1_value, c_b) = Self::funding_amounts(Amount::from_sat(open.amount), f_b, b, fee)?;
+                Self::check_park(u1_value, a, b, fee)?;
+                let psbt = self.build_funding_psbt([open.input, input], &u1_addr, u1_value, (&change, c_b))?;
                 let mine = self.wallet.sign_psbt(&psbt)?;
                 self.transport.send(
-                    &FundReply { p_b: my_key.into(), input, amount: amount.to_sat(), change, psbt: mine }.encode(),
+                    &FundReply { p_b: my_key.into(), input, amount: f_b.to_sat(), change, bob_payout: bob_payout.clone(), psbt: mine }.encode(),
                 )?;
                 let fin = FundFinal::decode(&self.transport.recv()?)?;
-                (u1, self.wallet.combine_finalize(&[&fin.psbt])?) // finalise the fully-signed tx
+                self.params.alice_payout = open.alice_payout;
+                self.params.bob_payout = bob_payout;
+                (u1, self.wallet.combine_finalize(&[&fin.psbt])?)
             }
         };
 
         let (u1_out, u1_value) = Self::locate_u1(&tx, &u1)?;
         self.params.u1_outpoint = u1_out;
         self.params.u1_value = u1_value;
-        self.log(&format!("joint PSBT funding built — U1 = {u1_out} ({} sat); TX1 held (not broadcast)", u1_value.to_sat()));
-        self.log(&self.decode_tx(&tx, "TX1 (joint funding, both inputs signed)"));
+        self.log(&format!("funding built (Alice-parks payjoin) — U1 = {u1_out} ({} sat); TX1 held", u1_value.to_sat()));
+        self.log(&self.decode_tx(&tx, "TX1 (2-in/2-out funding)"));
         self.funding_tx = Some(tx);
         self.persist(Phase::Funded)?;
         Ok(())
@@ -479,6 +521,11 @@ impl<T: Transport> BetChain for Bet<T> {
             BetRole::Player(s) => run_bob(&mut self.transport, &self.params, s)?,
         };
         self.setup = Some(result);
+        // Dealer: pre-build the enforced Alice-win reclaim now (valid only after t_1), so it's on disk
+        // before any funding is broadcast and recovery needs no live signing. See COVERT-TX-PLAN §8.
+        if matches!(self.role, BetRole::Dealer(_)) {
+            self.reclaim_tx = Some(self.build_reclaim_tx()?);
+        }
         self.log("setup complete — refund and settlement adaptor pre-signed");
         self.persist_refund()?; // safety net on disk BEFORE any funding is broadcast
         self.persist(Phase::SetupDone)?;
@@ -540,24 +587,12 @@ impl<T: Transport> BetChain for Bet<T> {
     }
 
     fn dealer_take_on_loss(&mut self) -> Result<()> {
-        let sk_a = match &self.role {
-            BetRole::Dealer(a) => Scalar::from(a.identity.sk),
-            BetRole::Player(_) => return Err(Error::Protocol("only the dealer reclaims")),
-        };
         // Wait for the relative timelock to mature: the claim output (created by the settlement)
-        // needs `alice_timeout` confirmations before its CSV leaf is spendable.
+        // needs `alice_timeout` confirmations before its CSV leaf is spendable — then broadcast the
+        // reclaim pre-signed at setup.
         self.wait_confirmed(self.settle_txid()?, self.params.alice_timeout as u32)?;
-        let (mut tx, pot, claim) = self.build_claim_spend_tx(Sequence::from_height(self.params.alice_timeout))?;
-        // Script-path spend of Alice's timeout leaf — the only script that ever hits the chain.
-        let sighash = script_spend_sighash(&tx, 0, &[claim.txout(pot)], &claim.alice_leaf)?;
-        let bsecp = bitcoin::secp256k1::Secp256k1::new();
-        let sk = SecretKey::from_slice(&sk_a.serialize()).map_err(|_| Error::Protocol("bad key"))?;
-        let sig = bsecp
-            .sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &BKeypair::from_secret_key(&bsecp, &sk))
-            .serialize();
-        let cb = claim.control_block(&claim.alice_leaf)?;
-        tx.input[0].witness = Witness::from_slice(&[sig.as_slice(), claim.alice_leaf.as_bytes(), &cb.serialize()]);
-        self.submit_claim(&tx, "claim (Alice timeout — script-path spend)", "Alice-timeout leaf")
+        let tx = self.reclaim_tx.clone().ok_or(Error::Protocol("reclaim tx not pre-built at setup"))?;
+        self.submit_claim(&tx, "claim (Alice timeout — pre-signed script-path spend)", "Alice-timeout leaf")
     }
 }
 

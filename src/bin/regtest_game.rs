@@ -70,6 +70,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         refund_locktime: height + 100,
         alice_timeout: 6,
         pi_a_scheme: babilonia::pi_a::Scheme::Squaring,
+        alice_payout: String::new(), // filled by fund_pot
+        bob_payout: String::new(),
     };
 
     let (dch, pch) = channel_pair();

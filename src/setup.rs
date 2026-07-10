@@ -10,7 +10,9 @@
 //! On success each side holds the same pre-signed settlement (Alice can `adapt` it with `d` and
 //! broadcast → reveals `d`; Bob then `extract`s `d` and decrypts `a_c`) and the same refund.
 
-use bitcoin::{absolute::LockTime, Amount, OutPoint, Transaction, TxOut, XOnlyPublicKey};
+use std::str::FromStr;
+
+use bitcoin::{absolute::LockTime, Address, Amount, OutPoint, ScriptBuf, Transaction, TxOut, XOnlyPublicKey};
 use musig2::secp::{Point, Scalar};
 use musig2::{AdaptorSignature, LiftedSignature};
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,11 @@ pub struct GameParams {
     pub alice_timeout: u16,
     /// Which π_a construction to use (both parties must agree). See [`pi_a::Scheme`].
     pub pi_a_scheme: pi_a::Scheme,
+    /// Alice's payout address (parked `c_A` in the settlement, `F_A` in the refund). Filled by
+    /// `fund_pot` from the funding flights; empty until then. See COVERT-TX-PLAN §8.
+    pub alice_payout: String,
+    /// Bob's payout address (the refund's `b→Bob` output). Filled by `fund_pot`.
+    pub bob_payout: String,
 }
 
 /// Alice's private inputs.
@@ -95,8 +102,16 @@ fn x_only(p: &secp256k1::PublicKey) -> Result<XOnlyPublicKey> {
     XOnlyPublicKey::from_slice(&p.serialize()[1..33]).map_err(|_| Error::Protocol("bad x-only key"))
 }
 
+/// The scriptPubKey of a payout address string. The `scriptPubKey` is network-independent, so we
+/// `assume_checked` rather than thread the network through the setup driver.
+fn payout_spk(addr: &str) -> Result<ScriptBuf> {
+    Ok(Address::from_str(addr).map_err(|_| Error::Protocol("bad payout address"))?.assume_checked().script_pubkey())
+}
+
 /// Build the (identical, on both sides) settlement + refund txs and their key-spend sighashes for
-/// the pot `u1` given the claim key `k`.
+/// the pot `u1` given the claim key `k`. Both are the payment-manifold 2-out shape (Alice-parks,
+/// COVERT-TX-PLAN §8.2): the settlement pays `[O_K = S, c_A_out → alice_payout]` (O_K at vout 0),
+/// the refund `[F_A_out → alice_payout, b → bob_payout]`.
 fn tx_graph(
     u1: &TaprootKey,
     p_a: &secp256k1::PublicKey,
@@ -105,14 +120,28 @@ fn tx_graph(
 ) -> Result<(Transaction, [u8; 32], ClaimOutput, Transaction, [u8; 32])> {
     let prevout = u1.txout(params.u1_value);
     let claim = ClaimOutput::new(*k, x_only(p_a)?, params.alice_timeout)?;
-    let pot = params.u1_value.checked_sub(params.fee).ok_or(Error::Protocol("fee exceeds pot"))?;
-    let settle_tx = build_settlement(params.u1_outpoint, vec![claim.txout(pot)]);
+    let s = params.alice_stake + params.bob_stake; // at-risk pot; O_K carries exactly this
+    let c_a_out = params
+        .u1_value
+        .checked_sub(s)
+        .and_then(|v| v.checked_sub(params.fee))
+        .ok_or(Error::Protocol("settlement: c_A_out underflow"))?;
+    let alice_spk = payout_spk(&params.alice_payout)?;
+    let settle_tx = build_settlement(
+        params.u1_outpoint,
+        vec![claim.txout(s), TxOut { value: c_a_out, script_pubkey: alice_spk.clone() }],
+    );
     let settle_sighash = key_spend_sighash(&settle_tx, 0, &[prevout.clone()])?;
 
     let refund_locktime = LockTime::from_height(params.refund_locktime)
         .map_err(|_| Error::Protocol("bad refund locktime"))?;
-    let alice_out = TxOut { value: params.alice_stake, script_pubkey: u1.spk.clone() };
-    let bob_out = TxOut { value: params.bob_stake, script_pubkey: u1.spk.clone() };
+    let f_a_out = params
+        .u1_value
+        .checked_sub(params.bob_stake)
+        .and_then(|v| v.checked_sub(params.fee))
+        .ok_or(Error::Protocol("refund: F_A_out underflow"))?;
+    let alice_out = TxOut { value: f_a_out, script_pubkey: alice_spk };
+    let bob_out = TxOut { value: params.bob_stake, script_pubkey: payout_spk(&params.bob_payout)? };
     let refund_tx = build_refund(params.u1_outpoint, alice_out, bob_out, refund_locktime);
     let refund_sighash = key_spend_sighash(&refund_tx, 0, &[prevout])?;
     Ok((settle_tx, settle_sighash, claim, refund_tx, refund_sighash))
@@ -308,15 +337,22 @@ mod tests {
             claim: Keypair::new(&secp),
             guess: c, // a winning guess
         };
+        let payout = || {
+            let xo = XOnlyPublicKey::from_slice(&Keypair::new(&secp).pk.serialize()[1..33]).unwrap();
+            let bsecp = bitcoin::secp256k1::Secp256k1::new();
+            bitcoin::Address::p2tr(&bsecp, xo, None, bitcoin::Network::Regtest).to_string()
+        };
         let params = GameParams {
             u1_outpoint: OutPoint { txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()), vout: 0 },
-            u1_value: Amount::from_sat(500_000),
+            u1_value: Amount::from_sat(600_000),
             alice_stake: Amount::from_sat(250_000),
             bob_stake: Amount::from_sat(248_000),
             fee: Amount::from_sat(2_000),
             refund_locktime: 200,
             alice_timeout: 6,
             pi_a_scheme: pi_a::Scheme::Squaring,
+            alice_payout: payout(),
+            bob_payout: payout(),
         };
         // Snapshots for the post-run check.
         let d = alice.d;

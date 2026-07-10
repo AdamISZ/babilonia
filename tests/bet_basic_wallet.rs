@@ -7,6 +7,7 @@
 //! Requires `bitcoind`. Ignored by default. Run:
 //!   cargo test --features basic-wallet --test bet_basic_wallet -- --ignored --test-threads=1 --nocapture
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use babilonia::bet::{Bet, BetRole};
@@ -74,6 +75,8 @@ fn full_bet_with_basic_wallet_player_wins() {
         refund_locktime: height + 100,
         alice_timeout: 6,
         pi_a_scheme: babilonia::pi_a::Scheme::Squaring,
+        alice_payout: String::new(), // filled by fund_pot
+        bob_payout: String::new(),
     };
 
     let refund_dir = std::env::temp_dir().join(format!("bw-refund-{}", std::process::id()));
@@ -125,6 +128,31 @@ fn full_bet_with_basic_wallet_player_wins() {
     assert!(rec.funding_tx.is_some(), "funding tx persisted");
     let setup = rec.setup.expect("setup persisted in record");
     assert_eq!(setup.refund_tx.compute_txid(), refund.compute_txid(), "record's refund matches the broadcastable one");
+
+    // Covert shapes (COVERT-TX-PLAN §8): funding is a 2-out payjoin, and the settlement is a 2-out
+    // payment — `O_K = S` (the at-risk pot) + Alice's parked change `c_A_out → alice_payout`.
+    let funding = rec.funding_tx.as_ref().expect("funding tx");
+    assert_eq!(funding.output.len(), 2, "funding is a 2-out payjoin (U1 + Bob's change)");
+    let s = params.alice_stake + params.bob_stake; // O_K carries exactly S
+    assert_eq!(setup.settle_tx.output.len(), 2, "settlement is a 2-out payment (O_K + parked c_A)");
+    let o_k = setup.settle_tx.output.iter().filter(|o| o.value == s).count();
+    assert_eq!(o_k, 1, "settlement's O_K output pays exactly S = a + b");
+    let alice_spk = bitcoin::Address::from_str(&rec.params.alice_payout)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    let c_a = setup.settle_tx.output.iter().find(|o| o.script_pubkey == alice_spk).expect("c_A output → alice_payout");
+    assert!(c_a.value > Amount::ZERO, "Alice's parked change returns to her payout address");
+
+    // Phase 1b: the enforced Alice-win reclaim was pre-signed at setup, persisted, 2-out, and spends O_K.
+    let reclaim = setup.reclaim_tx.as_ref().expect("dealer pre-signed reclaim persisted");
+    assert_eq!(reclaim.output.len(), 2, "reclaim is a 2-out payment");
+    assert!(!reclaim.input[0].witness.is_empty(), "reclaim is fully witnessed (script-path)");
+    assert_eq!(
+        reclaim.input[0].previous_output,
+        OutPoint { txid: setup.settle_tx.compute_txid(), vout: 0 },
+        "reclaim spends O_K (settlement vout 0)"
+    );
     let _ = std::fs::remove_dir_all(&refund_dir);
 
     println!("[ok] full bet with basic-wallet (BDK) — joint funding + broadcastable refund + round-tripped recovery record ✓");

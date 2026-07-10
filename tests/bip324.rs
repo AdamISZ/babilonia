@@ -215,18 +215,25 @@ fn setup_handshake_over_bip324() {
         claim: Keypair::new(&secp),
         guess: c, // a winning guess
     };
+    let payout = || {
+        let xo = bitcoin::XOnlyPublicKey::from_slice(&Keypair::new(&secp).pk.serialize()[1..33]).unwrap();
+        let bsecp = bitcoin::secp256k1::Secp256k1::new();
+        bitcoin::Address::p2tr(&bsecp, xo, None, bitcoin::Network::Regtest).to_string()
+    };
     let params = GameParams {
         u1_outpoint: bitcoin::OutPoint {
             txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
             vout: 0,
         },
-        u1_value: bitcoin::Amount::from_sat(500_000),
+        u1_value: bitcoin::Amount::from_sat(600_000),
         alice_stake: bitcoin::Amount::from_sat(250_000),
         bob_stake: bitcoin::Amount::from_sat(248_000),
         fee: bitcoin::Amount::from_sat(2_000),
         refund_locktime: 200,
         alice_timeout: 6,
         pi_a_scheme: babilonia::pi_a::Scheme::Squaring,
+        alice_payout: payout(),
+        bob_payout: payout(),
     };
 
     // Bob runs on another thread; both sides talk only through their Bip324Transport.

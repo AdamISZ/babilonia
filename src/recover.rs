@@ -14,7 +14,7 @@ use crate::chain::Chain;
 use crate::musig::{adapt, extract, signature_bytes};
 use crate::persist::{BetRecord, Phase, SetupData};
 use crate::reveal::{claim_secret, recover_a_c, won};
-use crate::txgraph::{build_claim_spend, key_spend_sighash, script_spend_sighash, ClaimOutput};
+use crate::txgraph::{build_claim_spend, key_spend_sighash, split_payment, ClaimOutput};
 use crate::wallet::Wallet;
 use crate::{Error, Result};
 
@@ -40,9 +40,10 @@ fn x_only(p: &Point) -> Result<XOnlyPublicKey> {
     XOnlyPublicKey::from_slice(&p.serialize()[1..33]).map_err(|_| Error::Protocol("bad x-only key"))
 }
 
-/// Settlement output value (= claim-output prevout value): the pot minus one on-chain fee.
+/// Value of the settlement's claim output `O_K` — the at-risk pot `S = a + b` (Alice's parked `c_A`
+/// returns as the settlement's other output, not through `O_K`).
 fn pot(rec: &BetRecord) -> Result<Amount> {
-    rec.params.u1_value.checked_sub(rec.params.fee).ok_or(Error::Protocol("fee exceeds pot"))
+    Ok(rec.params.alice_stake + rec.params.bob_stake)
 }
 
 /// Inspect a record against the chain and summarize the recovery situation.
@@ -122,7 +123,7 @@ pub fn recover(rec: &BetRecord, chain: &dyn Chain, wallet: &dyn Wallet) -> Resul
     }
     match &rec.role {
         BetRole::Player(_) => observe_and_claim(rec, setup, chain, wallet),
-        BetRole::Dealer(_) => reclaim_action(rec, setup, chain, wallet),
+        BetRole::Dealer(_) => reclaim_action(rec, setup, chain),
     }
 }
 
@@ -172,16 +173,21 @@ fn observe_and_claim(rec: &BetRecord, setup: &SetupData, chain: &dyn Chain, wall
     if !won(&a_c, &setup.thimbles[guess]) {
         return Ok("outcome: you lost — nothing to claim (the dealer reclaims after the timeout)".into());
     }
-    // Won → key-path spend of the claim output (K = W_b + A_y; dlog = w_b + a_c).
+    // Won → key-path spend of the claim output (K = W_b + A_y; dlog = w_b + a_c), 2-out payment shape.
     let claim = ClaimOutput::new(setup.k, x_only(&setup.p_a)?, rec.params.alice_timeout)?;
     let pot = pot(rec)?;
-    let dest = wallet.receive_address()?;
     let out_value = pot.checked_sub(rec.params.fee).ok_or(Error::Protocol("fee exceeds claim"))?;
+    let (pay, change) = split_payment(out_value)?;
+    let pay_addr = wallet.receive_address()?;
+    let change_addr = wallet.change_address()?;
     let claim_out = OutPoint { txid: settle_txid, vout: 0 };
     let mut tx = build_claim_spend(
         claim_out,
         Sequence::default(),
-        vec![TxOut { value: out_value, script_pubkey: dest.script_pubkey() }],
+        vec![
+            TxOut { value: pay, script_pubkey: pay_addr.script_pubkey() },
+            TxOut { value: change, script_pubkey: change_addr.script_pubkey() },
+        ],
     );
     let claim_sk = claim_secret(&w_b, &a_c)?;
     let sighash = key_spend_sighash(&tx, 0, &[claim.txout(pot)])?;
@@ -194,34 +200,17 @@ fn observe_and_claim(rec: &BetRecord, setup: &SetupData, chain: &dyn Chain, wall
     Ok(format!("you won — claimed the pot via key-path, broadcast {txid}"))
 }
 
-fn reclaim_action(rec: &BetRecord, setup: &SetupData, chain: &dyn Chain, wallet: &dyn Wallet) -> Result<String> {
-    let sk_a = match &rec.role {
-        BetRole::Dealer(a) => Scalar::from(a.identity.sk),
-        BetRole::Player(_) => return Err(Error::Protocol("only the dealer reclaims")),
-    };
+fn reclaim_action(rec: &BetRecord, setup: &SetupData, chain: &dyn Chain) -> Result<String> {
+    if !matches!(rec.role, BetRole::Dealer(_)) {
+        return Err(Error::Protocol("only the dealer reclaims"));
+    }
     let settle_txid = setup.settle_tx.compute_txid();
     let confs = chain.confirmations(settle_txid)?.unwrap_or(0);
     if confs < rec.params.alice_timeout as u32 {
         return Err(Error::Protocol("timeout leaf not mature yet (needs alice_timeout confirmations)"));
     }
-    let claim = ClaimOutput::new(setup.k, x_only(&setup.p_a)?, rec.params.alice_timeout)?;
-    let pot = pot(rec)?;
-    let dest = wallet.receive_address()?;
-    let out_value = pot.checked_sub(rec.params.fee).ok_or(Error::Protocol("fee exceeds claim"))?;
-    let claim_out = OutPoint { txid: settle_txid, vout: 0 };
-    let mut tx = build_claim_spend(
-        claim_out,
-        Sequence::from_height(rec.params.alice_timeout),
-        vec![TxOut { value: out_value, script_pubkey: dest.script_pubkey() }],
-    );
-    let sighash = script_spend_sighash(&tx, 0, &[claim.txout(pot)], &claim.alice_leaf)?;
-    let bsecp = bitcoin::secp256k1::Secp256k1::new();
-    let sk = SecretKey::from_slice(&sk_a.serialize()).map_err(|_| Error::Protocol("bad key"))?;
-    let sig = bsecp
-        .sign_schnorr_no_aux_rand(&Message::from_digest(sighash), &BKeypair::from_secret_key(&bsecp, &sk))
-        .serialize();
-    let cb = claim.control_block(&claim.alice_leaf)?;
-    tx.input[0].witness = Witness::from_slice(&[sig.as_slice(), claim.alice_leaf.as_bytes(), &cb.serialize()]);
-    let txid = chain.broadcast(&tx)?;
-    Ok(format!("reclaimed the pot via the timeout leaf, broadcast {txid}"))
+    // The 2-out CSV-leaf reclaim was fully witnessed at setup (COVERT-TX-PLAN §8) — just broadcast it.
+    let tx = setup.reclaim_tx.as_ref().ok_or(Error::Protocol("no pre-signed reclaim tx in record"))?;
+    let txid = chain.broadcast(tx)?;
+    Ok(format!("reclaimed the pot via the pre-signed timeout leaf, broadcast {txid}"))
 }

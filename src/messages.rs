@@ -32,24 +32,28 @@ const TAG_FUND_FINAL: u8 = 7;
 
 // --- joint PSBT funding sub-protocol (before the setup driver; v5 §P1) ---
 
-/// Funding flight 1 — Dealer → Player. The dealer's funding key, the input it contributes, and its
-/// change address. From this the player can build the shared funding PSBT.
+/// Funding flight 1 — Dealer → Player. The dealer (Alice, the *parker*) contributes her **whole**
+/// input (`amount = F_A`, no funding change) and gives her **payout** address `alice_payout` — where
+/// her parked surplus `c_A` / refund `F_A` return (the settlement's & refund's Alice-side output). See
+/// COVERT-TX-PLAN §8.
 #[derive(Clone, Debug)]
 pub struct FundOpen {
     pub p_a: Point,
     pub input: OutPoint,
     pub amount: u64,
-    pub change: String,
+    pub alice_payout: String,
 }
 
-/// Funding flight 2 — Player → Dealer. The player's contribution plus its wallet-signed PSBT (its
-/// own input signed).
+/// Funding flight 2 — Player → Dealer. The player (Bob) contributes his input, takes his funding
+/// **change** `c_B` (`change`), gives his **payout** address `bob_payout` (the refund's `b→Bob`
+/// output), and the wallet-signed PSBT (his own input signed).
 #[derive(Clone, Debug)]
 pub struct FundReply {
     pub p_b: Point,
     pub input: OutPoint,
     pub amount: u64,
     pub change: String,
+    pub bob_payout: String,
     pub psbt: String,
 }
 
@@ -285,13 +289,13 @@ impl FundOpen {
         put_point(&mut out, &self.p_a);
         put_outpoint(&mut out, &self.input);
         out.extend_from_slice(&self.amount.to_le_bytes());
-        put_lp(&mut out, self.change.as_bytes());
+        put_lp(&mut out, self.alice_payout.as_bytes());
         out
     }
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf);
         r.tag(TAG_FUND_OPEN)?;
-        let m = FundOpen { p_a: r.point()?, input: r.outpoint()?, amount: r.u64()?, change: r.string()? };
+        let m = FundOpen { p_a: r.point()?, input: r.outpoint()?, amount: r.u64()?, alice_payout: r.string()? };
         r.finish()?;
         Ok(m)
     }
@@ -304,6 +308,7 @@ impl FundReply {
         put_outpoint(&mut out, &self.input);
         out.extend_from_slice(&self.amount.to_le_bytes());
         put_lp(&mut out, self.change.as_bytes());
+        put_lp(&mut out, self.bob_payout.as_bytes());
         put_lp(&mut out, self.psbt.as_bytes());
         out
     }
@@ -315,6 +320,7 @@ impl FundReply {
             input: r.outpoint()?,
             amount: r.u64()?,
             change: r.string()?,
+            bob_payout: r.string()?,
             psbt: r.string()?,
         };
         r.finish()?;
