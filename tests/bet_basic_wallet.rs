@@ -76,6 +76,9 @@ fn full_bet_with_basic_wallet_player_wins() {
         pi_a_scheme: babilonia::pi_a::Scheme::Squaring,
     };
 
+    let refund_dir = std::env::temp_dir().join(format!("bw-refund-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&refund_dir);
+
     let (dealer_ch, player_ch) = channel_pair();
     let mut dealer = Bet::new(
         Box::new(alice_w),
@@ -84,7 +87,8 @@ fn full_bet_with_basic_wallet_player_wins() {
         dealer_ch,
         params.clone(),
         BetRole::Dealer(alice),
-    );
+    )
+    .with_state_dir(refund_dir.clone());
     let mut player = Bet::new(
         Box::new(bob_w),
         node.rpc_chain().unwrap(),
@@ -102,5 +106,18 @@ fn full_bet_with_basic_wallet_player_wins() {
 
     assert_eq!(player_res.unwrap(), Outcome::PlayerWins);
     assert_eq!(dealer_res.unwrap(), Outcome::PlayerWins);
-    println!("[ok] full bet with basic-wallet (BDK) — joint PSBT funding worked; player won ✓");
+
+    // The dealer persisted a *broadcastable* refund to disk before funding was ever broadcast — the
+    // safety net that lets funds be reclaimed from U1 even if the process dies mid-bet.
+    let files: Vec<_> = std::fs::read_dir(&refund_dir).expect("refund dir").filter_map(|e| e.ok()).collect();
+    assert_eq!(files.len(), 1, "exactly one refund file persisted");
+    let content = std::fs::read_to_string(files[0].path()).unwrap();
+    let hex = content.lines().find_map(|l| l.strip_prefix("refund_tx: ")).expect("refund_tx line").trim();
+    let refund: bitcoin::Transaction = bitcoin::consensus::encode::deserialize_hex(hex).expect("valid refund tx");
+    assert_eq!(refund.input.len(), 1, "refund spends the single U1 output");
+    assert!(!refund.input[0].witness.is_empty(), "refund is fully signed (witnessed)");
+    assert_eq!(refund.output.len(), 2, "refund returns stakes to both funders");
+    let _ = std::fs::remove_dir_all(&refund_dir);
+
+    println!("[ok] full bet with basic-wallet (BDK) — joint PSBT funding + persisted broadcastable refund ✓");
 }

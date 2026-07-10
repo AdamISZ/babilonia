@@ -7,6 +7,7 @@
 //! dealer `settle` (adapt with `d`, broadcast — posts `d`) → `observe` (player extracts `d` and
 //! decrypts `a_c`; dealer watches the claim output) → `claim`/`dealer_take_on_loss`.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,8 @@ pub struct Bet<T: Transport> {
     recovered_a_c: Option<Scalar>,
     funding_tx: Option<Transaction>,
     progress: Option<Box<dyn Fn(&str) + Send>>,
+    /// Where the fully-signed refund is persisted before funding is broadcast (recovery on abort).
+    state_dir: Option<PathBuf>,
 }
 
 impl<T: Transport> Bet<T> {
@@ -72,6 +75,7 @@ impl<T: Transport> Bet<T> {
             recovered_a_c: None,
             funding_tx: None,
             progress: None,
+            state_dir: None,
         }
     }
 
@@ -82,20 +86,70 @@ impl<T: Transport> Bet<T> {
         self
     }
 
+    /// Directory in which the fully-signed refund is written before funding is broadcast, so an abort
+    /// after funding confirms is still recoverable. Unset ⇒ not persisted (ephemeral use / tests);
+    /// the node app always sets it.
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
+        self.state_dir = Some(dir);
+        self
+    }
+
     fn log(&self, msg: &str) {
         if let Some(sink) = &self.progress {
             sink(msg);
         }
     }
 
+    /// Persist the fully-signed refund transaction to disk **before** funding is broadcast, so the pot
+    /// locked in U1 is always recoverable — even if this process dies — by broadcasting the saved tx
+    /// once the chain passes `refund_locktime`. A refund path that only lives in memory is no safety
+    /// net at all. This runs inside [`setup`], which is a hard gate before `broadcast_funding`: if it
+    /// fails, funding is never broadcast, so the stakes stay in the wallets.
+    fn persist_refund(&self) -> Result<()> {
+        let Some(dir) = &self.state_dir else {
+            self.log("WARNING: no state dir — refund NOT persisted; an abort after funding would strand the pot");
+            return Ok(());
+        };
+        let s = self.state()?;
+        let mut refund = s.refund_tx.clone();
+        refund.input[0].witness = Witness::from_slice(&[signature_bytes(&s.refund_sig).as_slice()]);
+        let raw = hex::encode(bitcoin::consensus::serialize(&refund));
+        let lock = self.params.refund_locktime;
+        let record = format!(
+            "# babilonia refund — reclaims the jointly-funded pot (U1) back to the funders.\n\
+             # Recover by broadcasting refund_tx once the chain passes block {lock}:\n\
+             #   bitcoin-cli sendrawtransaction <refund_tx>\n\
+             u1: {}\n\
+             locktime: {lock}\n\
+             refund_tx: {raw}\n",
+            self.params.u1_outpoint,
+        );
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("refund-{}.txt", self.params.u1_outpoint.txid));
+        std::fs::write(&path, record)?;
+        self.log(&format!("refund persisted → {} (broadcast after block {lock} to reclaim)", path.display()));
+        Ok(())
+    }
+
     fn state(&self) -> Result<&SetupResult> {
         self.setup.as_ref().ok_or(Error::Protocol("setup not complete"))
+    }
+
+    /// A wall-clock budget for one on-chain step (a tx appearing, or gaining one confirmation).
+    /// Regtest has a fast background miner (sub-second blocks); real networks take block-time, so this
+    /// must be generous or a legitimately-confirming tx is abandoned — the signet "did not reach the
+    /// required confirmations" bug, where a 60s deadline fired before a ~minute-plus block.
+    fn step_budget(&self) -> Duration {
+        match self.network {
+            Network::Regtest => Duration::from_secs(60),
+            _ => Duration::from_secs(30 * 60), // ~3 signet/mainnet blocks of slack per step
+        }
     }
 
     /// Wait until `txid` has at least `min_conf` confirmations. Blocks come from the network (or a
     /// background miner on regtest), not from us; this polls the [`Chain`] view.
     fn wait_confirmed(&self, txid: Txid, min_conf: u32) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + self.step_budget() * min_conf.max(1);
         loop {
             if let Some(c) = self.chain.confirmations(txid)? {
                 if c >= min_conf {
@@ -235,7 +289,7 @@ impl<T: Transport> Bet<T> {
             (s.settle_pre.clone(), s.ctxt, s.thimbles)
         };
         self.log("waiting for the dealer's settlement on-chain…");
-        let tx = self.poll_tx(self.settle_txid()?, Duration::from_secs(30))?;
+        let tx = self.poll_tx(self.settle_txid()?, self.step_budget())?;
         let sig_bytes = tx.input[0].witness.iter().next().ok_or(Error::Protocol("no settlement witness"))?;
         let compact = CompactSignature::from_bytes(sig_bytes).map_err(|_| Error::Protocol("bad settlement sig"))?;
         let final_sig = compact.lift_nonce().map_err(|_| Error::Protocol("cannot lift settlement sig"))?;
@@ -254,7 +308,9 @@ impl<T: Transport> Bet<T> {
     fn dealer_observe(&self) -> Result<Outcome> {
         self.log("watching the claim output — did the player claim?");
         let claim = OutPoint { txid: self.settle_txid()?, vout: 0 };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Give the player's claim time to land *and confirm* on a real network (the dealer only sees
+        // confirmed spends here); too short would wrongly declare DealerWins on a legitimate claim.
+        let deadline = Instant::now() + self.step_budget() * 2;
         loop {
             if !self.chain.utxo_unspent(claim)? {
                 return Ok(Outcome::PlayerWins); // claim output was spent by the player
@@ -384,6 +440,7 @@ impl<T: Transport> BetChain for Bet<T> {
         };
         self.setup = Some(result);
         self.log("setup complete — refund and settlement adaptor pre-signed");
+        self.persist_refund()?; // safety net on disk BEFORE any funding is broadcast
         Ok(())
     }
 

@@ -50,6 +50,9 @@ pub struct Config {
     pub fee_sats: u64,
     pub alice_timeout: u16,
     pub pi_a_scheme: pi_a::Scheme,
+    /// Runtime-only (not persisted): directory for on-disk bet artifacts — notably the recovery
+    /// refund. Derived from the config's location by [`NodeCore::with_config_path`]; `None` ⇒ off.
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -62,6 +65,7 @@ impl Default for Config {
             fee_sats: 2_000,
             alice_timeout: 6,
             pi_a_scheme: pi_a::Scheme::Squaring,
+            state_dir: None,
         }
     }
 }
@@ -438,6 +442,8 @@ impl NodeCore {
 
     /// Persist config to `path` on every `set` (and expect it was loaded from there at startup).
     pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
+        // Persist bet artifacts (the recovery refund) next to the config, e.g. ~/.babilonia/bets.
+        self.config.state_dir = path.parent().map(|d| d.join("bets"));
         self.config_path = Some(path);
         self
     }
@@ -753,6 +759,9 @@ fn play(
         }
     };
     let mut bet = Bet::new(wallet, chain, config.network, transport, params, role).with_progress(progress);
+    if let Some(dir) = &config.state_dir {
+        bet = bet.with_state_dir(dir.clone());
+    }
     let result = if is_dealer { play_dealer(&mut bet) } else { play_player(&mut bet) };
     match result {
         Ok(outcome) => {
