@@ -29,8 +29,9 @@ use crate::txgraph::{build_claim_spend, key_spend_sighash, script_spend_sighash,
 use crate::wallet::Wallet;
 use crate::{Error, Result};
 
-/// Total funding-transaction fee (split evenly between the two contributors).
-const FUND_FEE: Amount = Amount::from_sat(1_000);
+// Fee model: every tx (funding, settlement, claim, refund) pays the flat `params.fee`. The funding
+// fee is split evenly between the two contributors. TODO: a fee-rate (sat/vB) applied per tx by its
+// vsize, so the larger funding tx pays proportionally more — the right model for real networks.
 
 /// The party's role and its private inputs.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -388,7 +389,7 @@ impl<T: Transport> BetChain for Bet<T> {
     fn fund_pot(&mut self) -> Result<()> {
         let (alice_stake, bob_stake) = (self.params.alice_stake, self.params.bob_stake);
         let pot = alice_stake + bob_stake;
-        let half_fee = Amount::from_sat(FUND_FEE.to_sat() / 2);
+        let half_fee = Amount::from_sat(self.params.fee.to_sat() / 2);
 
         // Extract our funding pubkey (drop the `self.role` borrow before the &mut coordination).
         enum Side {
