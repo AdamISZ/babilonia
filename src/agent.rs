@@ -1037,13 +1037,21 @@ mod rpc_backend {
     pub struct BasicWalletBackend {
         inner: RpcBackend,
         datadir: PathBuf,
+        /// One warm wallet, built + synced once and cloned per `wallet()` call — clones share its
+        /// synced chain state, so we delta-sync (new blocks only) instead of rescanning from the
+        /// birthday every time. Avoids the multi-second `balance` on each REPL command.
+        cached: std::sync::Mutex<Option<basic_wallet::BasicWallet>>,
     }
 
     #[cfg(feature = "basic-wallet")]
     impl BasicWalletBackend {
         /// `datadir` holds the BDK wallet state (mnemonic + birthday); created on first use.
         pub fn new(rpc_url: String, cookie: PathBuf, network: Network, datadir: PathBuf) -> Self {
-            BasicWalletBackend { inner: RpcBackend::new(rpc_url, cookie, network, String::new()), datadir }
+            BasicWalletBackend {
+                inner: RpcBackend::new(rpc_url, cookie, network, String::new()),
+                datadir,
+                cached: std::sync::Mutex::new(None),
+            }
         }
     }
 
@@ -1054,14 +1062,15 @@ mod rpc_backend {
         }
 
         fn wallet(&self) -> Result<Box<dyn crate::wallet::Wallet>> {
-            let w = basic_wallet::BasicWallet::open_at(
-                &self.datadir,
-                self.inner.network,
-                &self.inner.rpc_url,
-                &self.inner.cookie,
-            )
-            .map_err(|e| crate::Error::Wallet(format!("{e:#}")))?;
-            Ok(Box::new(w))
+            let mut cache = self.cached.lock().unwrap();
+            if cache.is_none() {
+                let w = basic_wallet::BasicWallet::open_at(&self.datadir, self.inner.network, &self.inner.rpc_url, &self.inner.cookie)
+                    .map_err(|e| crate::Error::Wallet(format!("{e:#}")))?;
+                *cache = Some(w);
+            }
+            let w = cache.as_ref().unwrap();
+            w.sync().map_err(|e| crate::Error::Wallet(format!("{e:#}")))?; // delta-sync a warm wallet: fast
+            Ok(Box::new(w.clone()))
         }
 
         fn chain(&self) -> Result<Box<dyn crate::chain::Chain>> {

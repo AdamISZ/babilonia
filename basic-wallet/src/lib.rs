@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use bdk_bitcoind_rpc::bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -27,9 +27,12 @@ const FEE_BUFFER: Amount = Amount::from_sat(1_000);
 
 /// A minimal BDK wallet over a bitcoind RPC connection. Interior-mutable (a `Mutex`) so the
 /// `&self` [`babilonia::wallet::Wallet`] methods can drive BDK's `&mut` API and the type stays `Send`.
+/// Cheaply `Clone` (state shared via `Arc`) so a caller can cache one warm wallet and hand out clones
+/// that all share the synced chain state — avoiding a full rescan-from-birthday on every use.
+#[derive(Clone)]
 pub struct BasicWallet {
-    wallet: Mutex<Wallet>,
-    rpc: Client,
+    wallet: Arc<Mutex<Wallet>>,
+    rpc: Arc<Client>,
     network: Network,
     birthday: u32,
 }
@@ -91,7 +94,7 @@ impl BasicWallet {
             .map_err(|e| anyhow!("wallet create: {e}"))?;
         let _ = wallet.reveal_addresses_to(KeychainKind::External, GAP);
         let _ = wallet.reveal_addresses_to(KeychainKind::Internal, GAP);
-        let w = Self { wallet: Mutex::new(wallet), rpc, network, birthday };
+        let w = Self { wallet: Arc::new(Mutex::new(wallet)), rpc: Arc::new(rpc), network, birthday };
         w.sync()?;
         Ok(w)
     }
@@ -101,7 +104,7 @@ impl BasicWallet {
         let mut wallet = self.wallet.lock().unwrap();
         let cp = wallet.latest_checkpoint();
         let start = cp.height().max(self.birthday);
-        let mut emitter = Emitter::new(&self.rpc, cp, start);
+        let mut emitter = Emitter::new(&*self.rpc, cp, start);
         while let Some(ev) = emitter.next_block()? {
             let h = ev.block_height();
             wallet.apply_block_connected_to(&ev.block, h, ev.connected_to())?;
