@@ -77,9 +77,33 @@ fn spend_inputs(inputs: &[(OutPoint, Sequence)], outputs: Vec<TxOut>, lock_time:
 }
 
 /// RefundTx: spends `U1` back to the original stakes, `nLockTime t_r`. The no-reveal fallback; a
-/// plain 2-party MuSig2 key-path spend.
-pub fn build_refund(u1: OutPoint, alice: TxOut, bob: TxOut, refund_locktime: LockTime) -> Transaction {
-    spend_inputs(&[(u1, Sequence::ENABLE_LOCKTIME_NO_RBF)], vec![alice, bob], refund_locktime)
+/// plain 2-party MuSig2 key-path spend. `outputs` are already in their final (shuffled) order.
+pub fn build_refund(u1: OutPoint, outputs: Vec<TxOut>, refund_locktime: LockTime) -> Transaction {
+    spend_inputs(&[(u1, Sequence::ENABLE_LOCKTIME_NO_RBF)], outputs, refund_locktime)
+}
+
+/// Deterministic Fisher-Yates shuffle driven by a 32-byte `seed` (SHA-256 counter stream). Both
+/// parties to a co-signed tx derive the **same** order from a shared *secret* seed — so the output
+/// positions look random to an outside observer (no fixed "O_K first" tell) yet agree byte-for-byte.
+/// Single-builder txs pass a fresh random seed for the same effect. See COVERT-TX-PLAN §9.
+pub fn shuffle_seeded<T>(items: &mut [T], seed: &[u8; 32]) {
+    use bitcoin::hashes::{sha256, Hash, HashEngine};
+    for i in (1..items.len()).rev() {
+        let mut eng = sha256::Hash::engine();
+        eng.input(seed);
+        eng.input(&(i as u32).to_le_bytes());
+        let h = sha256::Hash::from_engine(eng);
+        let r = u64::from_le_bytes(h.to_byte_array()[..8].try_into().unwrap());
+        items.swap(i, (r % (i as u64 + 1)) as usize);
+    }
+}
+
+/// A fresh random 32-byte seed for shuffling a single-builder tx (funding / claim / reclaim).
+pub fn random_seed() -> [u8; 32] {
+    use rand::RngCore;
+    let mut s = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut s);
+    s
 }
 
 /// SettleTx: spends `U1` via a MuSig2 **adaptor signature locked to `D = d·G`** — completing it
@@ -216,6 +240,39 @@ mod tests {
         r2a.finalize_plain().unwrap()
     }
 
+    /// `shuffle_seeded` is deterministic per seed, a true permutation (no loss/dup), and different
+    /// seeds generally reorder differently — the property the co-signed/single-builder ordering relies on.
+    #[test]
+    fn shuffle_seeded_is_deterministic_permutation() {
+        let seed_a = [7u8; 32];
+        let seed_b = [9u8; 32];
+        let base: Vec<u32> = (0..8).collect();
+
+        let mut x = base.clone();
+        let mut y = base.clone();
+        shuffle_seeded(&mut x, &seed_a);
+        shuffle_seeded(&mut y, &seed_a);
+        assert_eq!(x, y, "same seed → same order");
+
+        let mut sorted = x.clone();
+        sorted.sort();
+        assert_eq!(sorted, base, "a permutation: every element preserved exactly once");
+
+        let mut z = base.clone();
+        shuffle_seeded(&mut z, &seed_b);
+        assert_ne!(x, z, "different seeds reorder differently");
+
+        // Two-element case (all our txs) resolves to swap-or-not, and both outcomes occur across seeds.
+        let outcomes: std::collections::HashSet<Vec<u8>> = (0u8..64)
+            .map(|i| {
+                let mut v = vec![0u8, 1u8];
+                shuffle_seeded(&mut v, &[i; 32]);
+                v
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 2, "both orderings of a 2-output tx are reachable");
+    }
+
     /// RefundTx spends U1 with a valid plain key-path signature.
     #[test]
     fn refund_one_input_plain() {
@@ -228,7 +285,7 @@ mod tests {
 
         let alice = TxOut { value: Amount::from_sat(100_000), script_pubkey: u1.spk.clone() };
         let bob = TxOut { value: Amount::from_sat(99_000), script_pubkey: u1.spk.clone() };
-        let tx = build_refund(outpoint(0x11), alice, bob, LockTime::from_height(200).unwrap());
+        let tx = build_refund(outpoint(0x11), vec![alice, bob], LockTime::from_height(200).unwrap());
 
         let sighash = key_spend_sighash(&tx, 0, &prevouts).unwrap();
         let sig = plain_sig(&u1, &a, &b, sighash);

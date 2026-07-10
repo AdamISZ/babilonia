@@ -23,7 +23,7 @@ use crate::musig::KeyAgg;
 use crate::pi_a;
 use crate::reveal::compute_k;
 use crate::sigma;
-use crate::txgraph::{build_refund, build_settlement, key_spend_sighash, ClaimOutput, TaprootKey};
+use crate::txgraph::{build_refund, build_settlement, key_spend_sighash, shuffle_seeded, ClaimOutput, TaprootKey};
 use crate::transport::Transport;
 use crate::{Error, Result};
 
@@ -108,15 +108,27 @@ fn payout_spk(addr: &str) -> Result<ScriptBuf> {
     Ok(Address::from_str(addr).map_err(|_| Error::Protocol("bad payout address"))?.assume_checked().script_pubkey())
 }
 
+/// A per-tx shuffle seed for a co-signed tx: `SHA256(domain ‖ shared)` where `shared` is the
+/// ECDH secret both parties (and *only* they) share. Distinct `domain` per tx ⇒ independent orders.
+fn order_seed(domain: &[u8], shared: &[u8; 32]) -> [u8; 32] {
+    use bitcoin::hashes::{sha256, Hash, HashEngine};
+    let mut eng = sha256::Hash::engine();
+    eng.input(domain);
+    eng.input(shared);
+    sha256::Hash::from_engine(eng).to_byte_array()
+}
+
 /// Build the (identical, on both sides) settlement + refund txs and their key-spend sighashes for
 /// the pot `u1` given the claim key `k`. Both are the payment-manifold 2-out shape (Alice-parks,
-/// COVERT-TX-PLAN §8.2): the settlement pays `[O_K = S, c_A_out → alice_payout]` (O_K at vout 0),
-/// the refund `[F_A_out → alice_payout, b → bob_payout]`.
+/// COVERT-TX-PLAN §8.2): the settlement pays `{O_K = S, c_A_out → alice_payout}`, the refund
+/// `{F_A_out → alice_payout, b → bob_payout}`. Output order is shuffled from the shared secret
+/// `shared` (§9) so it looks random on-chain while both parties derive the same bytes.
 fn tx_graph(
     u1: &TaprootKey,
     p_a: &secp256k1::PublicKey,
     k: &Point,
     params: &GameParams,
+    shared: &[u8; 32],
 ) -> Result<(Transaction, [u8; 32], ClaimOutput, Transaction, [u8; 32])> {
     let prevout = u1.txout(params.u1_value);
     let claim = ClaimOutput::new(*k, x_only(p_a)?, params.alice_timeout)?;
@@ -127,10 +139,9 @@ fn tx_graph(
         .and_then(|v| v.checked_sub(params.fee))
         .ok_or(Error::Protocol("settlement: c_A_out underflow"))?;
     let alice_spk = payout_spk(&params.alice_payout)?;
-    let settle_tx = build_settlement(
-        params.u1_outpoint,
-        vec![claim.txout(s), TxOut { value: c_a_out, script_pubkey: alice_spk.clone() }],
-    );
+    let mut settle_outs = vec![claim.txout(s), TxOut { value: c_a_out, script_pubkey: alice_spk.clone() }];
+    shuffle_seeded(&mut settle_outs, &order_seed(b"babilonia/settle-order", shared));
+    let settle_tx = build_settlement(params.u1_outpoint, settle_outs);
     let settle_sighash = key_spend_sighash(&settle_tx, 0, &[prevout.clone()])?;
 
     let refund_locktime = LockTime::from_height(params.refund_locktime)
@@ -140,11 +151,20 @@ fn tx_graph(
         .checked_sub(params.bob_stake)
         .and_then(|v| v.checked_sub(params.fee))
         .ok_or(Error::Protocol("refund: F_A_out underflow"))?;
-    let alice_out = TxOut { value: f_a_out, script_pubkey: alice_spk };
-    let bob_out = TxOut { value: params.bob_stake, script_pubkey: payout_spk(&params.bob_payout)? };
-    let refund_tx = build_refund(params.u1_outpoint, alice_out, bob_out, refund_locktime);
+    let mut refund_outs = vec![
+        TxOut { value: f_a_out, script_pubkey: alice_spk },
+        TxOut { value: params.bob_stake, script_pubkey: payout_spk(&params.bob_payout)? },
+    ];
+    shuffle_seeded(&mut refund_outs, &order_seed(b"babilonia/refund-order", shared));
+    let refund_tx = build_refund(params.u1_outpoint, refund_outs, refund_locktime);
     let refund_sighash = key_spend_sighash(&refund_tx, 0, &[prevout])?;
     Ok((settle_tx, settle_sighash, claim, refund_tx, refund_sighash))
+}
+
+/// The ECDH shared secret between the two funding keys — `x_a·P_b = x_b·P_a`, known only to the two
+/// parties. Seeds the co-signed txs' output shuffle (both derive it, observers can't).
+fn shared_secret(sk: &secp256k1::SecretKey, other_pk: &secp256k1::PublicKey) -> [u8; 32] {
+    secp256k1::ecdh::SharedSecret::new(other_pk, sk).secret_bytes()
 }
 
 /// Run Alice's side (signer index 0).
@@ -179,8 +199,9 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
     }
     let p_b_pub: secp256k1::PublicKey = commit.p_b.into();
     let u1 = TaprootKey::new(s.identity.pk, p_b_pub)?;
+    let shared = shared_secret(&s.identity.sk, &p_b_pub);
     let (settle_tx, settle_sighash, _claim, refund_tx, refund_sighash) =
-        tx_graph(&u1, &s.identity.pk, &commit.k, params)?;
+        tx_graph(&u1, &s.identity.pk, &commit.k, params, &shared)?;
 
     // Alice's MuSig2 sessions (distinct fresh seeds — nonce hygiene).
     let (r1_refund, refund_nonce) = u1.keyagg.first_round(0, s.identity.sk, fresh_seed())?;
@@ -251,8 +272,9 @@ pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) ->
 
     let p_a_pub: secp256k1::PublicKey = open.p_a.into();
     let u1 = TaprootKey::new(p_a_pub, s.funding.pk)?;
+    let shared = shared_secret(&s.funding.sk, &p_a_pub);
     let (settle_tx, settle_sighash, _claim, refund_tx, refund_sighash) =
-        tx_graph(&u1, &p_a_pub, &k, params)?;
+        tx_graph(&u1, &p_a_pub, &k, params, &shared)?;
 
     // Bob's sessions + nonces.
     let (r1_refund, refund_nonce) = u1.keyagg.first_round(1, s.funding.sk, fresh_seed())?;

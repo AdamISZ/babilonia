@@ -25,7 +25,10 @@ use crate::reveal::{claim_secret, recover_a_c, won};
 use crate::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams, SetupResult};
 use crate::transport::Transport;
 use crate::persist::{new_id, BetRecord, Phase, SetupData};
-use crate::txgraph::{build_claim_spend, key_spend_sighash, script_spend_sighash, split_payment, ClaimOutput, TaprootKey};
+use crate::txgraph::{
+    build_claim_spend, key_spend_sighash, random_seed, script_spend_sighash, shuffle_seeded, split_payment, ClaimOutput,
+    TaprootKey,
+};
 use crate::wallet::Wallet;
 use crate::{Error, Result};
 
@@ -267,7 +270,14 @@ impl<T: Transport> Bet<T> {
         u1_value: Amount,
         bob_change: (&str, Amount),
     ) -> Result<String> {
-        let outputs = [(u1_addr.to_string(), u1_value), (bob_change.0.to_string(), bob_change.1)];
+        // Player-built (single builder) → fresh random order for both inputs and outputs, so neither
+        // "dealer input first" nor "U1 first" is a fixed tell (COVERT-TX-PLAN §9). The dealer verifies
+        // order-independently, and `locate_u1` finds U1 by scriptPubKey. The wallets preserve order
+        // (RPC createpsbt array order; BDK `TxOrdering::Untouched`).
+        let mut inputs = inputs.to_vec();
+        shuffle_seeded(&mut inputs, &random_seed());
+        let mut outputs = vec![(u1_addr.to_string(), u1_value), (bob_change.0.to_string(), bob_change.1)];
+        shuffle_seeded(&mut outputs, &random_seed());
         self.wallet.create_psbt(&inputs, &outputs)
     }
 
@@ -335,6 +345,19 @@ impl<T: Transport> Bet<T> {
         Ok(self.state()?.settle_tx.compute_txid())
     }
 
+    /// Locate `O_K` in the (output-shuffled) settlement tx by its scriptPubKey — it may sit at any
+    /// vout now that the settlement outputs are randomized (COVERT-TX-PLAN §9).
+    fn o_k_outpoint(&self) -> Result<OutPoint> {
+        let claim_spk = self.claim_output()?.spk;
+        let settle_tx = &self.state()?.settle_tx;
+        let vout = settle_tx
+            .output
+            .iter()
+            .position(|o| o.script_pubkey == claim_spk)
+            .ok_or(Error::Protocol("O_K not found in settlement outputs"))?;
+        Ok(OutPoint { txid: settle_tx.compute_txid(), vout: vout as u32 })
+    }
+
     /// Value carried by the settlement's claim output `O_K` — the at-risk pot `S = a + b` (Alice's
     /// parked `c_A` returns as the settlement's *other* output, not through `O_K`).
     fn pot(&self) -> Result<Amount> {
@@ -369,7 +392,7 @@ impl<T: Transport> Bet<T> {
     /// unspent past the window ⇒ DealerWins.
     fn dealer_observe(&self) -> Result<Outcome> {
         self.log("watching the claim output — did the player claim?");
-        let claim = OutPoint { txid: self.settle_txid()?, vout: 0 };
+        let claim = self.o_k_outpoint()?;
         // Give the player's claim time to land *and confirm* on a real network (the dealer only sees
         // confirmed spends here); too short would wrongly declare DealerWins on a legitimate claim.
         let deadline = Instant::now() + self.step_budget() * 2;
@@ -389,19 +412,18 @@ impl<T: Transport> Bet<T> {
     fn build_claim_spend_tx(&self, sequence: Sequence) -> Result<(Transaction, Amount, ClaimOutput)> {
         let claim = self.claim_output()?;
         let pot = self.pot()?; // O_K value = S
-        let claim_out = OutPoint { txid: self.settle_txid()?, vout: 0 };
+        let claim_out = self.o_k_outpoint()?;
         let out_value = pot.checked_sub(self.params.fee).ok_or(Error::Protocol("fee exceeds claim"))?;
         let (pay, change) = split_payment(out_value)?;
         let pay_addr = self.wallet.receive_address()?;
         let change_addr = self.wallet.change_address()?;
-        let tx = build_claim_spend(
-            claim_out,
-            sequence,
-            vec![
-                TxOut { value: pay, script_pubkey: pay_addr.script_pubkey() },
-                TxOut { value: change, script_pubkey: change_addr.script_pubkey() },
-            ],
-        );
+        // Single-builder tx → a fresh random output order (COVERT-TX-PLAN §9).
+        let mut outs = vec![
+            TxOut { value: pay, script_pubkey: pay_addr.script_pubkey() },
+            TxOut { value: change, script_pubkey: change_addr.script_pubkey() },
+        ];
+        shuffle_seeded(&mut outs, &random_seed());
+        let tx = build_claim_spend(claim_out, sequence, outs);
         Ok((tx, pot, claim))
     }
 

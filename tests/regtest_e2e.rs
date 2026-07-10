@@ -212,7 +212,7 @@ fn refund_after_locktime_on_regtest() {
     let bob = TxOut { value: Amount::from_sat(1_000), script_pubkey: f.node.new_address().unwrap().script_pubkey() };
 
     let build_refund_tx = || {
-        let mut t = build_refund(f.u1_out, alice.clone(), bob.clone(), LockTime::from_height(t_r).unwrap());
+        let mut t = build_refund(f.u1_out, vec![alice.clone(), bob.clone()], LockTime::from_height(t_r).unwrap());
         let sh = key_spend_sighash(&t, 0, &prevouts).unwrap();
         t.input[0].witness = Witness::from_slice(&[plain_witness(&f.u1, &f.a, &f.b, sh).as_slice()]);
         t

@@ -14,7 +14,7 @@ use crate::chain::Chain;
 use crate::musig::{adapt, extract, signature_bytes};
 use crate::persist::{BetRecord, Phase, SetupData};
 use crate::reveal::{claim_secret, recover_a_c, won};
-use crate::txgraph::{build_claim_spend, key_spend_sighash, split_payment, ClaimOutput};
+use crate::txgraph::{build_claim_spend, key_spend_sighash, random_seed, shuffle_seeded, split_payment, ClaimOutput};
 use crate::wallet::Wallet;
 use crate::{Error, Result};
 
@@ -44,6 +44,19 @@ fn x_only(p: &Point) -> Result<XOnlyPublicKey> {
 /// returns as the settlement's other output, not through `O_K`).
 fn pot(rec: &BetRecord) -> Result<Amount> {
     Ok(rec.params.alice_stake + rec.params.bob_stake)
+}
+
+/// Locate `O_K` in the (output-shuffled) settlement tx by its scriptPubKey — it may sit at any vout
+/// (COVERT-TX-PLAN §9).
+fn o_k_outpoint(setup: &SetupData, alice_timeout: u16) -> Result<OutPoint> {
+    let claim_spk = ClaimOutput::new(setup.k, x_only(&setup.p_a)?, alice_timeout)?.spk;
+    let vout = setup
+        .settle_tx
+        .output
+        .iter()
+        .position(|o| o.script_pubkey == claim_spk)
+        .ok_or(Error::Protocol("O_K not found in settlement outputs"))?;
+    Ok(OutPoint { txid: setup.settle_tx.compute_txid(), vout: vout as u32 })
 }
 
 /// Inspect a record against the chain and summarize the recovery situation.
@@ -86,7 +99,7 @@ pub fn assess(rec: &BetRecord, chain: &dyn Chain) -> Result<Assessment> {
     if chain.get_transaction(settle_txid)?.is_none() {
         return Ok(mk("U1 already spent (refunded / by another path) — nothing to do".into(), false));
     }
-    let claim_out = OutPoint { txid: settle_txid, vout: 0 };
+    let claim_out = o_k_outpoint(setup, rec.params.alice_timeout)?;
     if !chain.utxo_unspent(claim_out)? {
         return Ok(mk("settlement claimed already — resolved".into(), false));
     }
@@ -180,15 +193,13 @@ fn observe_and_claim(rec: &BetRecord, setup: &SetupData, chain: &dyn Chain, wall
     let (pay, change) = split_payment(out_value)?;
     let pay_addr = wallet.receive_address()?;
     let change_addr = wallet.change_address()?;
-    let claim_out = OutPoint { txid: settle_txid, vout: 0 };
-    let mut tx = build_claim_spend(
-        claim_out,
-        Sequence::default(),
-        vec![
-            TxOut { value: pay, script_pubkey: pay_addr.script_pubkey() },
-            TxOut { value: change, script_pubkey: change_addr.script_pubkey() },
-        ],
-    );
+    let claim_out = o_k_outpoint(setup, rec.params.alice_timeout)?;
+    let mut outs = vec![
+        TxOut { value: pay, script_pubkey: pay_addr.script_pubkey() },
+        TxOut { value: change, script_pubkey: change_addr.script_pubkey() },
+    ];
+    shuffle_seeded(&mut outs, &random_seed()); // single-builder → fresh random order (§9)
+    let mut tx = build_claim_spend(claim_out, Sequence::default(), outs);
     let claim_sk = claim_secret(&w_b, &a_c)?;
     let sighash = key_spend_sighash(&tx, 0, &[claim.txout(pot)])?;
     let bsecp = bitcoin::secp256k1::Secp256k1::new();

@@ -144,14 +144,17 @@ fn full_bet_with_basic_wallet_player_wins() {
     let c_a = setup.settle_tx.output.iter().find(|o| o.script_pubkey == alice_spk).expect("c_A output → alice_payout");
     assert!(c_a.value > Amount::ZERO, "Alice's parked change returns to her payout address");
 
+    // The settlement's outputs are order-randomized (§9): O_K sits at whichever vout the shuffle put it.
+    let o_k_vout = setup.settle_tx.output.iter().position(|o| o.value == s).unwrap() as u32;
+
     // Phase 1b: the enforced Alice-win reclaim was pre-signed at setup, persisted, 2-out, and spends O_K.
     let reclaim = setup.reclaim_tx.as_ref().expect("dealer pre-signed reclaim persisted");
     assert_eq!(reclaim.output.len(), 2, "reclaim is a 2-out payment");
     assert!(!reclaim.input[0].witness.is_empty(), "reclaim is fully witnessed (script-path)");
     assert_eq!(
         reclaim.input[0].previous_output,
-        OutPoint { txid: setup.settle_tx.compute_txid(), vout: 0 },
-        "reclaim spends O_K (settlement vout 0)"
+        OutPoint { txid: setup.settle_tx.compute_txid(), vout: o_k_vout },
+        "reclaim spends O_K (located by scriptPubKey, any vout)"
     );
     let _ = std::fs::remove_dir_all(&refund_dir);
 
