@@ -30,8 +30,7 @@ const TAG_FUND_OPEN: u8 = 5;
 const TAG_FUND_REPLY: u8 = 6;
 const TAG_FUND_FINAL: u8 = 7;
 const TAG_COOP_REVEAL: u8 = 8;
-const TAG_COOP_CONCEDE: u8 = 9;
-const TAG_COOP_DECLINE: u8 = 10;
+const TAG_FUND_SIGN: u8 = 11;
 
 // --- joint PSBT funding sub-protocol (before the setup driver; v5 §P1) ---
 
@@ -49,7 +48,9 @@ pub struct FundOpen {
 
 /// Funding flight 2 — Player → Dealer. The player (Bob) contributes his input, takes his funding
 /// **change** `c_B` (`change`), gives his **payout** address `bob_payout` (the refund's `b→Bob`
-/// output), and the wallet-signed PSBT (his own input signed).
+/// output), and the **unsigned** funding PSBT he built. Signatures are *not* exchanged here — they
+/// come later, after the refund is pre-signed (see `FundSign`/`FundFinal`), so no broadcastable
+/// funding tx exists before its refund does.
 #[derive(Clone, Debug)]
 pub struct FundReply {
     pub p_b: Point,
@@ -60,8 +61,16 @@ pub struct FundReply {
     pub psbt: String,
 }
 
-/// Funding flight 3 — Dealer → Player. The dealer's wallet-signed PSBT, so the player can combine +
-/// finalize the same `TX1`.
+/// Funding **signing** flight 1 — Player → Dealer, sent only *after* the refund is pre-signed. The
+/// player's now wallet-signed PSBT (his own input signed) over the funding tx both sides agreed in
+/// `FundReply`.
+#[derive(Clone, Debug)]
+pub struct FundSign {
+    pub psbt: String,
+}
+
+/// Funding **signing** flight 2 — Dealer → Player. The dealer's countersigned PSBT (both inputs
+/// signed), so the player can combine + finalize the same `TX1`.
 #[derive(Clone, Debug)]
 pub struct FundFinal {
     pub psbt: String,
@@ -69,30 +78,19 @@ pub struct FundFinal {
 
 // --- cooperative dealer-win overlay (COVERT-TX-PLAN §10) ---
 
-/// Overlay flight 1 — Dealer → Player. Carries the **completed** settlement signature (Bob extracts
-/// `d` from it with his pre-sig, exactly as he would on-chain), the **unsigned** cooperative
-/// `U1 → [S, c_A]` spend (both outputs to Alice, settlement-shaped) to co-sign, and Alice's MuSig2
-/// nonce. Bob decides from `d` whether he lost; if so he co-signs `coop_tx` and the dealer is paid in
-/// one tx, no `d` on-chain, no `t_1` wait.
+/// The **single** overlay message — Dealer → Player. Carries the completed settlement signature (Bob
+/// extracts `d` from it, exactly as he would on-chain), the cooperative `U1 → [S, c_A]` spend (both
+/// outputs to Alice), and **Alice's MuSig2 partial** over it. Alice can produce that partial up front
+/// because the coop nonces were pre-exchanged in setup (`BobCommit`/`AliceReveal`). Bob needs no reply:
+/// if he lost he adds his own partial and broadcasts `coop_tx` himself; if he won he broadcasts the
+/// settlement himself. Alice's partial only ever completes a tx that pays Alice, so revealing it early
+/// is safe. See COVERT-TX-PLAN §10.
 #[derive(Clone, Debug)]
 pub struct CoopReveal {
     pub settle_sig: Vec<u8>,
     pub coop_tx: Transaction,
-    pub alice_nonce: PubNonce,
+    pub alice_partial: PartialSignature,
 }
-
-/// Overlay flight 2a — Player → Dealer. Bob **concedes** (he lost): his MuSig2 nonce + partial over
-/// the cooperative spend. Its presence *is* the concession; the dealer completes and broadcasts.
-#[derive(Clone, Debug)]
-pub struct CoopConcede {
-    pub bob_nonce: PubNonce,
-    pub bob_partial: PartialSignature,
-}
-
-/// Overlay flight 2b — Player → Dealer. Bob **declines** (he won, or won't cooperate): resolve
-/// on-chain via the enforced settlement path instead.
-#[derive(Clone, Debug)]
-pub struct CoopDecline;
 
 /// Flight 1 (P2) — Alice → Bob. Her funding key `P_a` and thimbles `A_1,A_2 = a_1·G, a_2·G` with
 /// PoKs.
@@ -114,6 +112,9 @@ pub struct BobCommit {
     pub pi_r: Vec<u8>,
     pub refund_nonce: PubNonce,
     pub settle_nonce: PubNonce,
+    /// Pre-exchanged nonce for the cooperative-overlay MuSig2 session (COVERT-TX-PLAN §10), so the
+    /// dealer can pre-sign the overlay in one message at resolution.
+    pub coop_nonce: PubNonce,
 }
 
 /// Flight 3 (P4) — Alice → Bob. Her session nonces, the encrypted outcome `ctxt = a_c + H(d)`, the
@@ -128,6 +129,8 @@ pub struct AliceReveal {
     pub pi_a: Vec<u8>,
     pub refund_partial: PartialSignature,
     pub settle_partial: PartialSignature,
+    /// Pre-exchanged cooperative-overlay nonce (see [`BobCommit::coop_nonce`]).
+    pub coop_nonce: PubNonce,
 }
 
 /// Flight 4 (P5) — Bob → Alice. His refund and settlement partials, completing both sessions.
@@ -257,6 +260,7 @@ impl BobCommit {
         put_lp(&mut out, &self.pi_r);
         put_nonce(&mut out, &self.refund_nonce);
         put_nonce(&mut out, &self.settle_nonce);
+        put_nonce(&mut out, &self.coop_nonce);
         out
     }
     pub fn decode(buf: &[u8]) -> Result<Self> {
@@ -268,6 +272,7 @@ impl BobCommit {
             pi_r: r.lp()?,
             refund_nonce: r.nonce()?,
             settle_nonce: r.nonce()?,
+            coop_nonce: r.nonce()?,
         };
         r.finish()?;
         Ok(m)
@@ -284,6 +289,7 @@ impl AliceReveal {
         put_lp(&mut out, &self.pi_a);
         put_partial(&mut out, &self.refund_partial);
         put_partial(&mut out, &self.settle_partial);
+        put_nonce(&mut out, &self.coop_nonce);
         out
     }
     pub fn decode(buf: &[u8]) -> Result<Self> {
@@ -297,6 +303,7 @@ impl AliceReveal {
             pi_a: r.lp()?,
             refund_partial: r.partial()?,
             settle_partial: r.partial()?,
+            coop_nonce: r.nonce()?,
         };
         r.finish()?;
         Ok(m)
@@ -364,6 +371,21 @@ impl FundReply {
     }
 }
 
+impl FundSign {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TAG_FUND_SIGN];
+        put_lp(&mut out, self.psbt.as_bytes());
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_FUND_SIGN)?;
+        let m = FundSign { psbt: r.string()? };
+        r.finish()?;
+        Ok(m)
+    }
+}
+
 impl FundFinal {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![TAG_FUND_FINAL];
@@ -384,62 +406,15 @@ impl CoopReveal {
         let mut out = vec![TAG_COOP_REVEAL];
         put_lp(&mut out, &self.settle_sig);
         put_tx(&mut out, &self.coop_tx);
-        put_nonce(&mut out, &self.alice_nonce);
+        put_partial(&mut out, &self.alice_partial);
         out
     }
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf);
         r.tag(TAG_COOP_REVEAL)?;
-        let m = CoopReveal { settle_sig: r.lp()?, coop_tx: r.tx()?, alice_nonce: r.nonce()? };
+        let m = CoopReveal { settle_sig: r.lp()?, coop_tx: r.tx()?, alice_partial: r.partial()? };
         r.finish()?;
         Ok(m)
-    }
-}
-
-impl CoopConcede {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![TAG_COOP_CONCEDE];
-        put_nonce(&mut out, &self.bob_nonce);
-        put_partial(&mut out, &self.bob_partial);
-        out
-    }
-    pub fn decode(buf: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(buf);
-        r.tag(TAG_COOP_CONCEDE)?;
-        let m = CoopConcede { bob_nonce: r.nonce()?, bob_partial: r.partial()? };
-        r.finish()?;
-        Ok(m)
-    }
-}
-
-impl CoopDecline {
-    pub fn encode(&self) -> Vec<u8> {
-        vec![TAG_COOP_DECLINE]
-    }
-    pub fn decode(buf: &[u8]) -> Result<Self> {
-        let mut r = Reader::new(buf);
-        r.tag(TAG_COOP_DECLINE)?;
-        r.finish()?;
-        Ok(CoopDecline)
-    }
-}
-
-/// Bob's overlay reply, dispatched by tag: a concession (he lost) or a decline (he won / won't).
-pub enum CoopReply {
-    Concede(CoopConcede),
-    Decline,
-}
-
-impl CoopReply {
-    pub fn decode(buf: &[u8]) -> Result<Self> {
-        match buf.first() {
-            Some(&TAG_COOP_CONCEDE) => Ok(CoopReply::Concede(CoopConcede::decode(buf)?)),
-            Some(&TAG_COOP_DECLINE) => {
-                CoopDecline::decode(buf)?;
-                Ok(CoopReply::Decline)
-            }
-            _ => Err(Error::Decode("expected a cooperative reply")),
-        }
     }
 }
 
@@ -478,8 +453,11 @@ mod tests {
             pi_r: vec![9],
             refund_nonce: some_nonce(),
             settle_nonce: some_nonce(),
+            coop_nonce: some_nonce(),
         };
-        assert_eq!(BobCommit::decode(&commit.encode()).unwrap().k, commit.k);
+        let dec = BobCommit::decode(&commit.encode()).unwrap();
+        assert_eq!(dec.k, commit.k);
+        assert_eq!(dec.coop_nonce, commit.coop_nonce);
 
         let reveal = AliceReveal {
             refund_nonce: some_nonce(),
@@ -489,10 +467,12 @@ mod tests {
             pi_a: vec![4, 5],
             refund_partial: MaybeScalar::from(some_scalar()),
             settle_partial: MaybeScalar::from(some_scalar()),
+            coop_nonce: some_nonce(),
         };
         let dec = AliceReveal::decode(&reveal.encode()).unwrap();
         assert_eq!(dec.ctxt, reveal.ctxt);
         assert_eq!(dec.settle_partial, reveal.settle_partial);
+        assert_eq!(dec.coop_nonce, reveal.coop_nonce);
 
         let auth = BobAuth {
             refund_partial: MaybeScalar::from(some_scalar()),
@@ -518,20 +498,45 @@ mod tests {
             }],
             output: vec![TxOut { value: bitcoin::Amount::from_sat(1234), script_pubkey: Default::default() }],
         };
-        let reveal = CoopReveal { settle_sig: vec![7u8; 64], coop_tx: tx.clone(), alice_nonce: some_nonce() };
+        let reveal =
+            CoopReveal { settle_sig: vec![7u8; 64], coop_tx: tx.clone(), alice_partial: MaybeScalar::from(some_scalar()) };
         let dec = CoopReveal::decode(&reveal.encode()).unwrap();
         assert_eq!(dec.settle_sig, reveal.settle_sig);
         assert_eq!(dec.coop_tx, tx);
-        assert_eq!(dec.alice_nonce, reveal.alice_nonce);
+        assert_eq!(dec.alice_partial, reveal.alice_partial);
+        // Wrong tag is rejected.
+        assert!(CoopReveal::decode(&AliceOpen { p_a: some_point(), a1: some_point(), a2: some_point(), thimble_poks: vec![] }.encode()).is_err());
+    }
 
-        let concede = CoopConcede { bob_nonce: some_nonce(), bob_partial: MaybeScalar::from(some_scalar()) };
-        match CoopReply::decode(&concede.encode()).unwrap() {
-            CoopReply::Concede(c) => assert_eq!(c.bob_partial, concede.bob_partial),
-            _ => panic!("expected concede"),
-        }
-        assert!(matches!(CoopReply::decode(&CoopDecline.encode()).unwrap(), CoopReply::Decline));
-        // A CoopReveal is not a valid reply.
-        assert!(CoopReply::decode(&reveal.encode()).is_err());
+    #[test]
+    fn fund_frames_round_trip() {
+        let outpoint = OutPoint { txid: Txid::all_zeros(), vout: 3 };
+        let open = FundOpen { p_a: some_point(), input: outpoint, amount: 100_000, alice_payout: "bcrt1qalice".into() };
+        let d = FundOpen::decode(&open.encode()).unwrap();
+        assert_eq!(d.amount, open.amount);
+        assert_eq!(d.alice_payout, open.alice_payout);
+        assert_eq!(d.input, outpoint);
+
+        let reply = FundReply {
+            p_b: some_point(),
+            input: outpoint,
+            amount: 250_000,
+            change: "bcrt1qchange".into(),
+            bob_payout: "bcrt1qbob".into(),
+            psbt: "cHNidP8B".into(),
+        };
+        let d = FundReply::decode(&reply.encode()).unwrap();
+        assert_eq!(d.change, reply.change);
+        assert_eq!(d.bob_payout, reply.bob_payout);
+        assert_eq!(d.psbt, reply.psbt);
+
+        // Funding-signing flights (Phase 2b): distinct frames, must not cross-decode.
+        let sign = FundSign { psbt: "cHNidP8Bsigned".into() };
+        assert_eq!(FundSign::decode(&sign.encode()).unwrap().psbt, sign.psbt);
+        let fin = FundFinal { psbt: "cHNidP8Bboth".into() };
+        assert_eq!(FundFinal::decode(&fin.encode()).unwrap().psbt, fin.psbt);
+        assert!(FundFinal::decode(&sign.encode()).is_err());
+        assert!(FundSign::decode(&fin.encode()).is_err());
     }
 
     #[test]

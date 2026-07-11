@@ -90,6 +90,13 @@ pub struct SetupResult {
     pub thimbles: [Point; 2],
     /// Alice's funding key `P_a` (both know it; needed to rebuild the claim output).
     pub p_a: Point,
+    /// Our **secret** seed for the cooperative-overlay MuSig2 nonce (COVERT-TX-PLAN §10). Regenerated
+    /// into a `Round1` at resolution to sign the overlay once. **In-memory only — never persisted**:
+    /// a restored-and-reused signing nonce is key-compromising, so a crash simply falls back to the
+    /// enforced path. (This is why it lives in `SetupResult`, not the persisted `SetupData`.)
+    pub coop_seed: [u8; 32],
+    /// The peer's pre-exchanged cooperative-overlay public nonce.
+    pub coop_peer_nonce: musig2::PubNonce,
 }
 
 fn ctx_keys(p_a: &Point, p_b: &Point) -> Vec<u8> {
@@ -206,6 +213,10 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
     // Alice's MuSig2 sessions (distinct fresh seeds — nonce hygiene).
     let (r1_refund, refund_nonce) = u1.keyagg.first_round(0, s.identity.sk, fresh_seed())?;
     let (r1_settle, settle_nonce) = u1.keyagg.first_round(0, s.identity.sk, fresh_seed())?;
+    // Cooperative-overlay nonce: exchange its *public* part now (nonces are message-independent), keep
+    // the seed to regenerate + sign the overlay once at resolution. Seed stays in-memory only (§10).
+    let coop_seed = fresh_seed();
+    let (_r1_coop, coop_nonce) = u1.keyagg.first_round(0, s.identity.sk, coop_seed)?;
     let d_point = s.d.base_point_mul();
     let (mut r2_refund, refund_partial) = r1_refund.sign(1, commit.refund_nonce, s.identity.sk, refund_sighash)?;
     let (mut r2_settle, settle_partial) =
@@ -222,7 +233,8 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
 
     // Flight 3 (P4).
     ch.send(
-        &AliceReveal { refund_nonce, settle_nonce, ctxt, d_point, pi_a, refund_partial, settle_partial }.encode(),
+        &AliceReveal { refund_nonce, settle_nonce, ctxt, d_point, pi_a, refund_partial, settle_partial, coop_nonce }
+            .encode(),
     )?;
 
     // Flight 4 (P5): Bob's partials complete both sessions.
@@ -245,6 +257,8 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
         k: commit.k,
         thimbles,
         p_a,
+        coop_seed,
+        coop_peer_nonce: commit.coop_nonce,
     })
 }
 
@@ -279,9 +293,12 @@ pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) ->
     // Bob's sessions + nonces.
     let (r1_refund, refund_nonce) = u1.keyagg.first_round(1, s.funding.sk, fresh_seed())?;
     let (r1_settle, settle_nonce) = u1.keyagg.first_round(1, s.funding.sk, fresh_seed())?;
+    // Cooperative-overlay nonce — public part exchanged now, seed kept in-memory to sign once (§10).
+    let coop_seed = fresh_seed();
+    let (_r1_coop, coop_nonce) = u1.keyagg.first_round(1, s.funding.sk, coop_seed)?;
 
     // Flight 2 (P3).
-    ch.send(&BobCommit { p_b, k, pi_r, refund_nonce, settle_nonce }.encode())?;
+    ch.send(&BobCommit { p_b, k, pi_r, refund_nonce, settle_nonce, coop_nonce }.encode())?;
 
     // Flight 3 (P4): Alice's nonces, ctxt, D, π_a, partials.
     let reveal = AliceReveal::decode(&ch.recv()?)?;
@@ -319,6 +336,8 @@ pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) ->
         k,
         thimbles,
         p_a: open.p_a,
+        coop_seed,
+        coop_peer_nonce: reveal.coop_nonce,
     })
 }
 

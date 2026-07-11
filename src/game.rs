@@ -37,8 +37,10 @@ pub trait BetChain {
     /// Run the interactive setup: pre-sign the refund and the settlement adaptor, commit the
     /// encrypted outcome. Interactive.
     fn setup(&mut self) -> Result<()>;
-    /// Broadcast the funding transaction and wait for `U1` to confirm. Called only **after** the
-    /// refund is pre-signed (v5 §P1: no funds are locked until the refund exists).
+    /// **Sign** the funding transaction (the signatures are deliberately deferred to here), broadcast
+    /// it, and wait for `U1` to confirm. Runs only **after** the refund is pre-signed, so the first
+    /// broadcastable funding tx to exist anywhere is created with its refund already in hand — no funds
+    /// can be locked into `U1` without a refund. Interactive (a two-message signing exchange).
     fn broadcast_funding(&mut self) -> Result<()>;
     /// Try to resolve the bet cooperatively before touching the chain (COVERT-TX-PLAN §10). The
     /// dealer reveals the outcome off-chain; if the **player lost**, he co-signs a single key-path
