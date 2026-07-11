@@ -16,7 +16,7 @@
 //! length-prefixed, each message a 1-byte tag; a bounds-checked reader rejects short/trailing.
 
 use bitcoin::hashes::Hash;
-use bitcoin::{OutPoint, Txid};
+use bitcoin::{OutPoint, Transaction, Txid};
 use musig2::secp::{MaybeScalar, Point, Scalar};
 use musig2::{BinaryEncoding, PartialSignature, PubNonce};
 
@@ -29,6 +29,9 @@ const TAG_BOB_AUTH: u8 = 4;
 const TAG_FUND_OPEN: u8 = 5;
 const TAG_FUND_REPLY: u8 = 6;
 const TAG_FUND_FINAL: u8 = 7;
+const TAG_COOP_REVEAL: u8 = 8;
+const TAG_COOP_CONCEDE: u8 = 9;
+const TAG_COOP_DECLINE: u8 = 10;
 
 // --- joint PSBT funding sub-protocol (before the setup driver; v5 §P1) ---
 
@@ -63,6 +66,33 @@ pub struct FundReply {
 pub struct FundFinal {
     pub psbt: String,
 }
+
+// --- cooperative dealer-win overlay (COVERT-TX-PLAN §10) ---
+
+/// Overlay flight 1 — Dealer → Player. Carries the **completed** settlement signature (Bob extracts
+/// `d` from it with his pre-sig, exactly as he would on-chain), the **unsigned** cooperative
+/// `U1 → [S, c_A]` spend (both outputs to Alice, settlement-shaped) to co-sign, and Alice's MuSig2
+/// nonce. Bob decides from `d` whether he lost; if so he co-signs `coop_tx` and the dealer is paid in
+/// one tx, no `d` on-chain, no `t_1` wait.
+#[derive(Clone, Debug)]
+pub struct CoopReveal {
+    pub settle_sig: Vec<u8>,
+    pub coop_tx: Transaction,
+    pub alice_nonce: PubNonce,
+}
+
+/// Overlay flight 2a — Player → Dealer. Bob **concedes** (he lost): his MuSig2 nonce + partial over
+/// the cooperative spend. Its presence *is* the concession; the dealer completes and broadcasts.
+#[derive(Clone, Debug)]
+pub struct CoopConcede {
+    pub bob_nonce: PubNonce,
+    pub bob_partial: PartialSignature,
+}
+
+/// Overlay flight 2b — Player → Dealer. Bob **declines** (he won, or won't cooperate): resolve
+/// on-chain via the enforced settlement path instead.
+#[derive(Clone, Debug)]
+pub struct CoopDecline;
 
 /// Flight 1 (P2) — Alice → Bob. Her funding key `P_a` and thimbles `A_1,A_2 = a_1·G, a_2·G` with
 /// PoKs.
@@ -129,6 +159,9 @@ fn put_outpoint(out: &mut Vec<u8>, o: &OutPoint) {
     out.extend_from_slice(&o.txid.to_byte_array());
     out.extend_from_slice(&o.vout.to_le_bytes());
 }
+fn put_tx(out: &mut Vec<u8>, tx: &Transaction) {
+    put_lp(out, &bitcoin::consensus::encode::serialize(tx));
+}
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -180,6 +213,9 @@ impl<'a> Reader<'a> {
         let txid = Txid::from_byte_array(self.take(32)?.try_into().unwrap());
         let vout = u32::from_le_bytes(self.take(4)?.try_into().unwrap());
         Ok(OutPoint { txid, vout })
+    }
+    fn tx(&mut self) -> Result<Transaction> {
+        bitcoin::consensus::encode::deserialize(&self.lp()?).map_err(|_| Error::Decode("invalid transaction"))
     }
     fn finish(self) -> Result<()> {
         if self.pos == self.buf.len() {
@@ -343,6 +379,70 @@ impl FundFinal {
     }
 }
 
+impl CoopReveal {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TAG_COOP_REVEAL];
+        put_lp(&mut out, &self.settle_sig);
+        put_tx(&mut out, &self.coop_tx);
+        put_nonce(&mut out, &self.alice_nonce);
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_COOP_REVEAL)?;
+        let m = CoopReveal { settle_sig: r.lp()?, coop_tx: r.tx()?, alice_nonce: r.nonce()? };
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl CoopConcede {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TAG_COOP_CONCEDE];
+        put_nonce(&mut out, &self.bob_nonce);
+        put_partial(&mut out, &self.bob_partial);
+        out
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_COOP_CONCEDE)?;
+        let m = CoopConcede { bob_nonce: r.nonce()?, bob_partial: r.partial()? };
+        r.finish()?;
+        Ok(m)
+    }
+}
+
+impl CoopDecline {
+    pub fn encode(&self) -> Vec<u8> {
+        vec![TAG_COOP_DECLINE]
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf);
+        r.tag(TAG_COOP_DECLINE)?;
+        r.finish()?;
+        Ok(CoopDecline)
+    }
+}
+
+/// Bob's overlay reply, dispatched by tag: a concession (he lost) or a decline (he won / won't).
+pub enum CoopReply {
+    Concede(CoopConcede),
+    Decline,
+}
+
+impl CoopReply {
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        match buf.first() {
+            Some(&TAG_COOP_CONCEDE) => Ok(CoopReply::Concede(CoopConcede::decode(buf)?)),
+            Some(&TAG_COOP_DECLINE) => {
+                CoopDecline::decode(buf)?;
+                Ok(CoopReply::Decline)
+            }
+            _ => Err(Error::Decode("expected a cooperative reply")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +499,39 @@ mod tests {
             settle_partial: MaybeScalar::from(some_scalar()),
         };
         assert_eq!(BobAuth::decode(&auth.encode()).unwrap().settle_partial, auth.settle_partial);
+    }
+
+    #[test]
+    fn coop_frames_round_trip() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+        use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Default::default(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: bitcoin::Amount::from_sat(1234), script_pubkey: Default::default() }],
+        };
+        let reveal = CoopReveal { settle_sig: vec![7u8; 64], coop_tx: tx.clone(), alice_nonce: some_nonce() };
+        let dec = CoopReveal::decode(&reveal.encode()).unwrap();
+        assert_eq!(dec.settle_sig, reveal.settle_sig);
+        assert_eq!(dec.coop_tx, tx);
+        assert_eq!(dec.alice_nonce, reveal.alice_nonce);
+
+        let concede = CoopConcede { bob_nonce: some_nonce(), bob_partial: MaybeScalar::from(some_scalar()) };
+        match CoopReply::decode(&concede.encode()).unwrap() {
+            CoopReply::Concede(c) => assert_eq!(c.bob_partial, concede.bob_partial),
+            _ => panic!("expected concede"),
+        }
+        assert!(matches!(CoopReply::decode(&CoopDecline.encode()).unwrap(), CoopReply::Decline));
+        // A CoopReveal is not a valid reply.
+        assert!(CoopReply::decode(&reveal.encode()).is_err());
     }
 
     #[test]

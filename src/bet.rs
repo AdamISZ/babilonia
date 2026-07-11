@@ -19,15 +19,15 @@ use musig2::CompactSignature;
 
 use crate::chain::Chain;
 use crate::game::{BetChain, Outcome};
-use crate::messages::{FundFinal, FundOpen, FundReply};
+use crate::messages::{CoopConcede, CoopDecline, CoopReply, CoopReveal, FundFinal, FundOpen, FundReply};
 use crate::musig::{adapt, extract, signature_bytes};
 use crate::reveal::{claim_secret, recover_a_c, won};
 use crate::setup::{run_alice, run_bob, AliceSecrets, BobSecrets, GameParams, SetupResult};
 use crate::transport::Transport;
 use crate::persist::{new_id, BetRecord, Phase, SetupData};
 use crate::txgraph::{
-    build_claim_spend, key_spend_sighash, random_seed, script_spend_sighash, shuffle_seeded, split_payment, ClaimOutput,
-    TaprootKey,
+    build_claim_spend, build_settlement, key_spend_sighash, random_seed, script_spend_sighash, shuffle_seeded,
+    split_payment, ClaimOutput, TaprootKey,
 };
 use crate::wallet::Wallet;
 use crate::{Error, Result};
@@ -341,6 +341,12 @@ impl<T: Transport> Bet<T> {
         ClaimOutput::new(s.k, x_only(&s.p_a)?, self.params.alice_timeout)
     }
 
+    /// Introspection helper: the settlement txid, once setup is complete. Lets a harness assert the
+    /// cooperative overlay resolved a dealer-win *without* ever broadcasting the settlement.
+    pub fn settlement_txid(&self) -> Option<Txid> {
+        self.setup.as_ref().map(|s| s.settle_tx.compute_txid())
+    }
+
     fn settle_txid(&self) -> Result<Txid> {
         Ok(self.state()?.settle_tx.compute_txid())
     }
@@ -455,6 +461,144 @@ impl<T: Transport> Bet<T> {
         self.log(&format!("spent the pot via the {via} — broadcast {txid}"));
         Ok(())
     }
+
+    // --- cooperative dealer-win overlay (COVERT-TX-PLAN §10) ---
+
+    /// Poll the transport until a frame arrives or `deadline` passes (a timed `recv` over `try_recv`).
+    fn recv_deadline(&mut self, deadline: Instant) -> Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(frame) = self.transport.try_recv()? {
+                return Ok(Some(frame));
+            }
+            if Instant::now() > deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The `U1` prevout (value + spk) for sighashing a spend of the pot — read from the funding tx
+    /// both parties hold.
+    fn u1_prevout(&self) -> Result<TxOut> {
+        let tx = self.funding_tx.as_ref().ok_or(Error::Protocol("no funding tx"))?;
+        tx.output
+            .get(self.params.u1_outpoint.vout as usize)
+            .cloned()
+            .ok_or(Error::Protocol("U1 output missing from funding tx"))
+    }
+
+    /// Build the unsigned cooperative `U1 → [S, c_A_out]` spend — both outputs to fresh dealer
+    /// addresses, amounts **identical to the settlement** (`S`, `u1_value − S − fee`), so on-chain it
+    /// is indistinguishable from a Bob-wins settlement. §9-shuffled (single-builder).
+    fn build_coop_tx(&self) -> Result<Transaction> {
+        let s = self.pot()?; // S = a + b
+        let c_a_out = self
+            .params
+            .u1_value
+            .checked_sub(s)
+            .and_then(|v| v.checked_sub(self.params.fee))
+            .ok_or(Error::Protocol("coop: c_A_out underflow"))?;
+        let s_addr = self.wallet.receive_address()?;
+        let c_addr = self.wallet.change_address()?;
+        let mut outs = vec![
+            TxOut { value: s, script_pubkey: s_addr.script_pubkey() },
+            TxOut { value: c_a_out, script_pubkey: c_addr.script_pubkey() },
+        ];
+        shuffle_seeded(&mut outs, &random_seed());
+        Ok(build_settlement(self.params.u1_outpoint, outs))
+    }
+
+    /// Dealer half of the overlay: reveal the completed settlement sig (so Bob reads `d` and sees he
+    /// lost), offer the cooperative `U1 → Alice` spend, and if Bob concedes, co-sign + broadcast it —
+    /// resolving the dealer-win in one tx, no `t_1`. `Some(DealerWins)` on cooperation; `None` to fall
+    /// back to the enforced settle path (Bob won, declined, or is offline).
+    fn dealer_cooperative(&mut self) -> Result<Option<Outcome>> {
+        let (d, a_sk) = match &self.role {
+            BetRole::Dealer(a) => (a.d, a.identity.sk),
+            BetRole::Player(_) => return Err(Error::Protocol("only the dealer runs the coop reveal")),
+        };
+        let (settle_pre, keyagg) = {
+            let s = self.state()?;
+            (s.settle_pre, s.keyagg.clone())
+        };
+        let final_sig = adapt(&settle_pre, &d).ok_or(Error::Protocol("settlement adapt failed"))?;
+        let coop_tx = self.build_coop_tx()?;
+        let prevout = self.u1_prevout()?;
+        let sighash = key_spend_sighash(&coop_tx, 0, &[prevout])?;
+        let (round1, alice_nonce) = keyagg.first_round(0, a_sk, random_seed())?;
+        self.transport.send(
+            &CoopReveal { settle_sig: signature_bytes(&final_sig).to_vec(), coop_tx: coop_tx.clone(), alice_nonce }
+                .encode(),
+        )?;
+        self.log("cooperative overlay: revealed d + offered a key-path U1→Alice spend; awaiting Bob…");
+        let Some(frame) = self.recv_deadline(Instant::now() + self.step_budget())? else {
+            self.log("no cooperative reply in time — falling back to the enforced settlement");
+            return Ok(None);
+        };
+        match CoopReply::decode(&frame)? {
+            CoopReply::Decline => {
+                self.log("Bob declined the overlay (he won, or won't cooperate) — enforced settlement");
+                Ok(None)
+            }
+            CoopReply::Concede(c) => {
+                let (mut round2, _alice_partial) = round1.sign(1, c.bob_nonce, a_sk, sighash)?;
+                round2.receive(1, c.bob_partial)?;
+                let sig = round2.finalize_plain()?;
+                let mut tx = coop_tx;
+                tx.input[0].witness = Witness::from_slice(&[signature_bytes(&sig).as_slice()]);
+                self.log(&self.decode_tx(&tx, "cooperative settlement (Bob conceded — MuSig2 key-path U1→Alice)"));
+                let txid = self.chain.broadcast(&tx)?;
+                self.wait_confirmed(txid, 1)?;
+                self.log(&format!("resolved cooperatively — broadcast {txid} (no settlement, no timeout)"));
+                self.persist(Phase::Done)?;
+                Ok(Some(Outcome::DealerWins))
+            }
+        }
+    }
+
+    /// Player half of the overlay: receive the reveal, read `d` (the same extraction as on-chain), and
+    /// if Bob lost, concede by co-signing the dealer's `U1 → Alice` spend. `Some(DealerWins)` when
+    /// conceded; `None` (after declining, or on timeout) to fall back to observe+claim.
+    fn player_cooperative(&mut self) -> Result<Option<Outcome>> {
+        let (guess, b_sk) = match &self.role {
+            BetRole::Player(p) => (p.guess, p.funding.sk),
+            BetRole::Dealer(_) => return Err(Error::Protocol("only the player answers the coop reveal")),
+        };
+        let (settle_pre, ctxt, thimbles, keyagg) = {
+            let s = self.state()?;
+            (s.settle_pre, s.ctxt, s.thimbles, s.keyagg.clone())
+        };
+        let Some(frame) = self.recv_deadline(Instant::now() + self.step_budget())? else {
+            return Ok(None); // no reveal — fall through to on-chain observation
+        };
+        let reveal = CoopReveal::decode(&frame)?;
+        // Extract d from the completed settlement sig — identical to reading it off-chain.
+        let compact =
+            CompactSignature::from_bytes(&reveal.settle_sig).map_err(|_| Error::Protocol("bad settlement sig"))?;
+        let final_sig = compact.lift_nonce().map_err(|_| Error::Protocol("cannot lift settlement sig"))?;
+        let d = extract(&settle_pre, &final_sig)
+            .and_then(|m| m.into_option())
+            .ok_or(Error::Protocol("could not extract d from the reveal"))?;
+        let a_c = recover_a_c(self.params.pi_a_scheme, &ctxt, &d)?;
+        if won(&a_c, &thimbles[guess]) {
+            self.transport.send(&CoopDecline.encode())?;
+            self.log("cooperative overlay: I won — declined; will claim on-chain");
+            return Ok(None);
+        }
+        // Bob lost → concede: co-sign the dealer's cooperative U1→Alice spend.
+        if reveal.coop_tx.input.first().map(|i| i.previous_output) != Some(self.params.u1_outpoint) {
+            return Err(Error::Protocol("coop tx does not spend U1"));
+        }
+        let prevout = self.u1_prevout()?;
+        let sighash = key_spend_sighash(&reveal.coop_tx, 0, &[prevout])?;
+        let (round1, bob_nonce) = keyagg.first_round(1, b_sk, random_seed())?;
+        let (_round2, bob_partial) = round1.sign(0, reveal.alice_nonce, b_sk, sighash)?;
+        self.transport.send(&CoopConcede { bob_nonce, bob_partial }.encode())?;
+        self.log("cooperative overlay: I lost — conceded (co-signed U1→Alice); done, no on-chain action");
+        self.recovered_a_c = Some(a_c);
+        self.persist(Phase::Done)?;
+        Ok(Some(Outcome::DealerWins))
+    }
 }
 
 impl<T: Transport> BetChain for Bet<T> {
@@ -552,6 +696,13 @@ impl<T: Transport> BetChain for Bet<T> {
         self.persist_refund()?; // safety net on disk BEFORE any funding is broadcast
         self.persist(Phase::SetupDone)?;
         Ok(())
+    }
+
+    fn try_cooperative_resolve(&mut self) -> Result<Option<Outcome>> {
+        match &self.role {
+            BetRole::Dealer(_) => self.dealer_cooperative(),
+            BetRole::Player(_) => self.player_cooperative(),
+        }
     }
 
     fn settle(&mut self) -> Result<()> {

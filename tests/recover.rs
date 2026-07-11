@@ -99,7 +99,12 @@ fn player_recovers_a_win_after_crash() {
         .path();
     let rec = BetRecord::load(&rec_path).expect("load player record");
     assert_eq!(rec.phase, Phase::FundingBroadcast, "player crashed right after funding");
-    let settle_txid = rec.setup.as_ref().unwrap().settle_tx.compute_txid();
+    // O_K carries exactly S = a + b, but the settlement outputs are order-randomized (§9), so locate
+    // it by value rather than assuming vout 0.
+    let settle_tx = &rec.setup.as_ref().unwrap().settle_tx;
+    let settle_txid = settle_tx.compute_txid();
+    let s = params.alice_stake + params.bob_stake;
+    let o_k_vout = settle_tx.output.iter().position(|o| o.value == s).expect("O_K in settlement") as u32;
 
     let recov_wallet = mk("recov");
     let chain = node.rpc_chain().unwrap();
@@ -108,7 +113,7 @@ fn player_recovers_a_win_after_crash() {
 
     // The claim landed: the settlement's claim output is now spent.
     node.client.generate_to_address(1, &mineaddr).unwrap();
-    let claim_out = OutPoint { txid: settle_txid, vout: 0 };
+    let claim_out = OutPoint { txid: settle_txid, vout: o_k_vout };
     assert!(!chain.utxo_unspent(claim_out).unwrap(), "claim output spent by the recovered claim");
     println!("[ok] player recovered a win from its record alone — extracted d and claimed ✓");
 }
