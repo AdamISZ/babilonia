@@ -250,3 +250,48 @@ fn setup_handshake_over_bip324() {
     assert_eq!(a.ctxt, b.ctxt);
     println!("[ok]   full v5 OP_RAND setup driver completed over BIP324 decoys ✓");
 }
+
+/// A peer that streams decoys faster than we drain them must not grow node memory without
+/// bound. Decoys never enter the message queue that fPauseRecv throttles, so without a cap the
+/// receiver buffers every decoy until `getdecoys` is called - a remote memory-exhaustion DoS.
+/// Here A floods B with far more decoy bytes than the receive cap while B never drains; the
+/// retained payload must stay bounded (excess decoys dropped) and B must stay responsive.
+#[test]
+#[ignore = "requires the patched bitcoind build; run with --ignored"]
+fn decoy_recv_buffer_is_bounded() {
+    let bin = patched_bitcoind();
+    let a = Node::regtest_with_binary(&bin).expect("patched node A");
+    let b = Node::regtest_with_binary(&bin).expect("patched node B");
+    b.connect_to(&a).expect("addnode");
+    assert!(b.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "B<->A on v2");
+    assert!(a.wait_for_v2_peers(1, Duration::from_secs(15)).unwrap(), "A sees v2 peer");
+    let b_id_on_a = a.only_peer_id().unwrap();
+    let a_id_on_b = b.only_peer_id().unwrap();
+
+    // Flood: 512 decoys x 64 KiB = 32 MiB, an order of magnitude past the receiver's cap. B never
+    // drains during the flood, so an unbounded buffer would retain the whole 32 MiB.
+    let chunk = vec![0xabu8; 64 * 1024];
+    let flooded = 512usize;
+    for _ in 0..flooded {
+        assert!(a.send_decoy(b_id_on_a, &chunk).unwrap(), "A queued decoy");
+    }
+
+    // Let the flood arrive (loopback), then drain once.
+    std::thread::sleep(Duration::from_secs(5));
+    let got = b.get_decoys(a_id_on_b).unwrap();
+    let retained: usize = got.iter().map(|d| d.len()).sum();
+    println!(
+        "[flood] A sent {} decoys ({} MiB); B retained {} frames ({} KiB)",
+        flooded,
+        flooded * chunk.len() / (1 << 20),
+        got.len(),
+        retained / 1024,
+    );
+
+    // The buffer is bounded well below what was sent (excess decoys were dropped, not buffered)...
+    assert!(retained <= 8 * 1024 * 1024, "retained decoy bytes bounded, got {retained}");
+    assert!(got.len() < flooded, "excess decoys dropped, not all {flooded} buffered");
+    // ...and B survived the flood: RPC still answers and the peer is still attached.
+    assert!(!b.peers().unwrap().is_empty(), "B still responsive with A attached after the flood");
+    println!("[ok]   decoy receive buffer stays bounded under a flood; node stays up");
+}
