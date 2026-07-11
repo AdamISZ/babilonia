@@ -17,7 +17,7 @@ completing that adaptor — which *posts `d` on-chain*. Bob then decrypts the ou
 
 ### The transactions
 
-The pot lives in one jointly-funded taproot output `U1`. From there, two transactions carry the outcome: the **settlement** spends `U1` and, by completing the adaptor, publishes `d`; the **claim** then spends the settlement's output — Bob's honest win is a plain **key-path** spend (indistinguishable from an ordinary payment), and only if a *losing* Bob griefs does Alice fall back to a timelock **script leaf**. A **refund** is the fallback if the settlement is never broadcast. (A future cooperative overlay will make even the loss path a plain key-path payment.)
+The pot lives in one jointly-funded taproot output `U1`. From there, two transactions carry the outcome: the **settlement** spends `U1` and, by completing the adaptor, publishes `d`; the **claim** then spends the settlement's output — Bob's honest win is a plain **key-path** spend (indistinguishable from an ordinary payment), and only if a *losing* Bob griefs does Alice fall back to a timelock **script leaf**. A **refund** is the fallback if the settlement is never broadcast. The graph below is the *enforced* path; when Bob cooperates a **cooperative overlay** (see below) collapses even the dealer-win into a single key-path payment.
 
 ```
    U1  — the pot: one jointly-funded P2TR output (key-path MuSig2(P_a, P_b))
@@ -48,7 +48,7 @@ The pot lives in one jointly-funded taproot output `U1`. From there, two transac
  └────────────────────────────────────┘   └────────────────────────────────────┘
 ```
 
-STILL TO DO: Cooperative Alice wins case: we don't want to broadcast the script path spend on the OP_CSV condition, which is not a standard payment; but if Bob cooperates they can use an overlay spend instead, and since Bob probably prefers that, he will likely do it.
+**Cooperative overlay (the common dealer-win path).** The script-leaf reclaim above is a *fallback*: an `OP_CSV` spend is not a standard payment, so it's avoided when possible. Instead, once the pot is confirmed Alice reveals `d` off-chain; a *losing* Bob then co-signs a single key-path `U1 → Alice` spend — a plain 2-output payment, with **no settlement broadcast, no script, and no timelock wait**. Bob has every reason to cooperate (he's lost either way, and it's cheaper and more private for both sides), so this is the usual path; the settlement + timeout-leaf graph above runs only if Bob is offline or refuses. See `docs/MESSAGES.md` (Phase 3) for the message flow.
 
 ### Architecture
 

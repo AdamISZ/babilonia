@@ -11,7 +11,9 @@
 //! ```
 //! Bob's honest win is thus indistinguishable from an ordinary taproot payment; the only script that
 //! can hit the chain is Alice's timeout leaf, and only when a losing Bob griefs. A *cooperative
-//! overlay* (spend `U1` straight to the winner, no settlement/scripts at all) is a future TODO.
+//! overlay* (spend `U1` straight to Alice on a Bob-loss — no settlement, no scripts) resolves the
+//! common dealer-win case in one key-path payment; this settlement/leaf path is the enforced
+//! fallback. See [`crate::bet`] `dealer_cooperative` / `player_cooperative`.
 //!
 //! **Interlock** (v5 §P6): Alice cannot spend `U1` (get the pot) without completing the settlement
 //! adaptor, which posts `d`; Bob then decrypts `a_c = ctxt − H(d)` and, if he won, claims `K`.
