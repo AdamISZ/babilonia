@@ -546,13 +546,19 @@ impl<T: Transport> Bet<T> {
         let deadline = Instant::now() + self.step_budget();
         loop {
             if self.chain.get_transaction(coop_txid)?.is_some() {
-                self.wait_confirmed(coop_txid, 1)?;
-                self.log(&format!("resolved cooperatively — {coop_txid} (no settlement, no timeout)"));
-                self.persist(Phase::Done)?;
+                // The overlay is in the mempool ⇒ the outcome is already fixed. U1 is a 2-of-2 so Bob
+                // can't conflict-spend it, and the settlement carries the *same* fee so he can't even
+                // RBF-swap — the only residual is eviction/delay. So report DealerWins now, no wait.
+                //
+                // Deliberately DO NOT mark the bet `Done`: if the overlay were evicted before
+                // confirming, `U1` is still unspent, and recovery must be free to secure the pot via
+                // the enforced fallback (re-settle + reclaim). Leaving the record at `FundingBroadcast`
+                // keeps that path open. (CPFP-bumping the captured overlay is a future enhancement.)
+                self.log(&format!("player broadcast the overlay {coop_txid} → DealerWins (unconfirmed; recoverable if it drops)"));
                 return Ok(Some(Outcome::DealerWins));
             }
             if self.chain.get_transaction(settle_txid)?.is_some() {
-                self.log("player broadcast the settlement — he won; resolving on-chain");
+                self.log(&format!("player broadcast the settlement {settle_txid} (he won) — resolving on-chain"));
                 return Ok(None); // enforced observe path (settle() is idempotent) handles the claim
             }
             if Instant::now() > deadline {
