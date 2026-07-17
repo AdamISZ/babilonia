@@ -78,8 +78,9 @@ There is **no ASCII "HELLO"** on the wire — `hello`/`accept`/`reject` are the 
 ## Phase 1 — Joint funding
 
 Builds the pot `U1` (a 2-of-2 MuSig2 key-path output) as a 2-in / 2-out payjoin. The **Player builds**
-the funding transaction (its wallet's natural shape) and signs its own input; the **Dealer verifies and
-co-signs**. The funding tx is *held, not broadcast*, until the refund is pre-signed in Phase 2.
+the funding transaction (its wallet's natural shape); both sides **agree** it and derive `U1`'s outpoint,
+but it stays **unsigned** here. Signatures are deferred to Phase 2b, *after* the refund is pre-signed,
+so no broadcastable funding tx exists before its refund does.
 
 | # | Message | Tag | Direction | Contents | Purpose |
 |---|---------|-----|-----------|----------|---------|
@@ -129,8 +130,9 @@ Player) broadcast it and wait for `U1` to confirm (on-chain, no message).
 
 ## Phase 3 — Resolution overlay (a single message)
 
-Once `U1` is confirmed, the Dealer resolves the bet with **one message** and then just watches the
-chain — Bob drives the on-chain step in either outcome. Implemented in [`src/bet.rs`](../src/bet.rs)
+Once `U1` is confirmed, the Dealer resolves the bet with **one message**. In the cooperative case she
+then just watches the chain — Bob drives the on-chain step in either outcome; if Bob is offline she
+falls back to the enforced path (Branch 3 below) and drives it herself. Implemented in [`src/bet.rs`](../src/bet.rs)
 (`dealer_cooperative` / `player_cooperative`).
 
 | # | Message | Tag | Direction | Contents | Purpose |
@@ -184,7 +186,9 @@ Legend: `A` = Dealer/Alice, `B` = Player/Bob. Time flows downward. `[chain]` mar
       ▼             (continues in one branch below)  ▼
 ```
 
-In all three branches the Dealer sends **one** message and then only observes; Bob broadcasts.
+In the two cooperative branches the Dealer sends **one** message and then only observes; Bob
+broadcasts. In the enforced branch (Bob offline) she sends the same message, then drives the on-chain
+step herself.
 
 ### Branch 1 — Dealer wins, cooperatively (the fast path)
 

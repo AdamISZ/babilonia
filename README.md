@@ -108,11 +108,18 @@ spinning up bitcoind (regtest)… up (network=Regtest)
 dealer chooses c=1; player guesses y=1  →  expecting PLAYER wins
 funded two wallets (alice, bob); U1 will be jointly funded during play
 ── playing ─────────────────────────────────────────────
-  [dealer] joint PSBT funding built — U1 = 9e2efa…:0 (500000 sat); TX1 held (not broadcast)
-  [dealer] running the 4-flight setup …
-  [dealer] settled — adapted with d and broadcast c930e1… (d now on-chain)
+  [dealer] funding agreed (Alice-parks payjoin, unsigned) — U1 = 1f8cf0…:1 (100248000 sat); signing deferred until the refund is pre-signed
+  [dealer] running the 4-flight setup (thimbles, K+π_r, ctxt/D/π_a, dual pre-sign)…
+  [dealer] setup complete — refund and settlement adaptor pre-signed
+  [dealer] TX1 (2-in/2-out funding, both inputs signed) (decoderawtransaction): …
+  [dealer] funding TX1 broadcast + confirmed (1f8cf0…)
+  [dealer] cooperative overlay: revealed d + a pre-signed U1→Alice spend; watching the chain…
+  [player] cooperative overlay: I won — broadcast the settlement; will claim O_K on-chain
   [player] extracted d, decrypted a_c → PlayerWins
-  [player] spent the pot via the <K> key path — broadcast 18a72a…
+  [player] spent the pot via the <K> key path — broadcast 88bf01…
+── result ──────────────────────────────────────────────
+dealer sees: PlayerWins
+player sees: PlayerWins
 🎉 PLAYER won and claimed the pot.
 ```
 
