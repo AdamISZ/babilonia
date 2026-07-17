@@ -67,6 +67,15 @@ txgraph · musig · sigma · pi_a · reveal · setup   the crypto / tx primitive
 **Three components are swappable behind traits**, around the `NodeCore` orchestrator: the **UI** (default: CLI REPL), **network messaging** (default: BIP324), and the **wallet**. Two wallets implement the `Wallet` seam: a lightweight default that drives `bitcoind`'s own wallet over RPC, and **`basic-wallet`** — a standalone reference wallet (a thin [BDK](https://bitcoindevkit.org) wrapper: BIP39, receive, spend, single-UTXO mode; regtest/signet/mainnet), a `basic-bitcoin-wallet` CLI in this
 Cargo workspace that any wallet developer can also import. `π_a` is implemented with **two selectable proof schemes** — a sigma-based `t²` construction (default, no heavy deps) and a Bulletproofs+Poseidon hash circuit (behind the `pi_a` feature); see [`docs/PI-A-NOTES.md`](docs/PI-A-NOTES.md).
 
+> **Delta from the paper — Poseidon is currently disabled.** The paper presents the Poseidon
+> hash-circuit route as an *alternative* to squaring, strongly caveated as needing expert review;
+> squaring, by contrast, comes with full proofs (a hiding reduction and a soundness/extraction proof,
+> albeit to **square-DDH** rather than DDH). That all stands. The only change in the code as of now is
+> *implementation maturity*: the Poseidon scheme is **not yet correctly implemented** — its Σ-part and
+> Bulletproofs commitments to `a_c`/`d` are not yet cryptographically bound — so it is **gated off** (a
+> dealer cannot select it and a player will not accept it) until that binding is added and reviewed.
+> **`Squaring` is the only usable scheme.** for now.
+
 **Crash recovery.** A bet holds real funds across several on-chain steps, so its state is persisted to disk at every transition — a full record (secrets, params, and the funding/settlement/refund transactions with their signatures) under `~/.babilonia/bets/`, plus a human-readable refund. Funding is never broadcast until the co-signed refund is safely on disk. After a crash or restart, either party recovers from the record *alone*, with no live peer: the REPL's `recover` command lists open bets and drives whatever each needs — broadcast the refund past its locktime, (re)settle, extract `d` and claim a win, or reclaim the timeout leaf. (Records currently hold secrets in clear; encryption at rest is a planned follow-on.)
 
 ## Installation

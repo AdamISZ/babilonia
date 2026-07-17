@@ -83,9 +83,12 @@ pub enum Scheme {
     /// mask is a quadratic residue, so low-entropy plaintexts are QR-distinguishable). Our thimble
     /// scalars and `t` are uniform, so the caveat holds.
     Squaring,
-    /// **Hand-rolled Poseidon.** `H(t) = Poseidon(t)` over `F_n`; the hash conjunct is a Bulletproofs
-    /// circuit (requires the `pi_a` Cargo feature). A field-native ZK hash — see the module docs for
-    /// the params caveat, and `docs/PI-A-NOTES.md` for Purify as a reviewed alternative.
+    /// **Hand-rolled Poseidon — DISABLED.** `H(t) = Poseidon(t)` over `F_n`; the hash conjunct is a
+    /// Bulletproofs circuit (requires the `pi_a` Cargo feature). Currently gated off in [`prove`] /
+    /// [`verify`] pending a soundness fix (its Σ- and Bulletproofs commitments are unbound — see
+    /// [`poseidon_disabled`] and `docs/planning/fable5-security-review.md` §1). The variant and the
+    /// circuit code are kept for future re-enablement; the negotiation layer (`agent`) refuses to
+    /// select it. See `docs/PI-A-NOTES.md` for Purify as a reviewed alternative.
     Poseidon,
 }
 
@@ -102,7 +105,8 @@ pub fn pad(scheme: Scheme, t: &Scalar) -> Scalar {
 pub fn prove(scheme: Scheme, st: &Statement, w: &Witness) -> Result<Proof> {
     match scheme {
         Scheme::Squaring => Ok(Proof(squaring::prove(st, w)?)),
-        Scheme::Poseidon => poseidon_prove(st, w),
+        // Poseidon is gated off — fail closed. See `poseidon_disabled`.
+        Scheme::Poseidon => Err(poseidon_disabled()),
     }
 }
 
@@ -110,8 +114,23 @@ pub fn prove(scheme: Scheme, st: &Statement, w: &Witness) -> Result<Proof> {
 pub fn verify(scheme: Scheme, st: &Statement, proof: &Proof) -> Result<bool> {
     match scheme {
         Scheme::Squaring => squaring::verify(st, &proof.0),
-        Scheme::Poseidon => poseidon_verify(st, proof),
+        // Poseidon is gated off — never accept a proof under it. See `poseidon_disabled`.
+        Scheme::Poseidon => Err(poseidon_disabled()),
     }
+}
+
+/// **`Scheme::Poseidon` is disabled pending a soundness fix.** Its Σ-part commitment to `a_c`/`d`
+/// (`sigma::AdaptorProof`) and the Bulletproofs hash-circuit commitments (`comm_a_c`/`comm_d`) are
+/// **not cryptographically bound** — nothing forces the `a_c`/`d` proven in the Σ-part to equal the
+/// `a_c'`/`d'` in the circuit. A dealer can therefore commit a ciphertext that decrypts to a
+/// non-thimble scalar, which makes `won()` always false — a **guaranteed dealer win**
+/// (`docs/planning/fable5-security-review.md` §1). Both `prove` and `verify` reject it so it can
+/// never gate a live bet. Re-enable **only** after adding the cross-commitment equality proof binding
+/// `C_a`/`D` to the circuit's `comm_a_c`/`comm_d` (and reviewing it). Use [`Scheme::Squaring`].
+fn poseidon_disabled() -> crate::Error {
+    crate::Error::Protocol(
+        "pi_a::Scheme::Poseidon is disabled pending a soundness fix (unbound Σ/Bulletproofs commitments); use Scheme::Squaring",
+    )
 }
 
 // --- Poseidon scheme (feature-gated implementation) ---
@@ -126,6 +145,7 @@ fn poseidon_pad(_t: &Scalar) -> Scalar {
 }
 
 #[cfg(feature = "pi_a")]
+#[allow(dead_code)] // gated off in `prove`/`verify` pending the commitment-binding fix; kept for re-enablement
 fn poseidon_prove(st: &Statement, w: &Witness) -> Result<Proof> {
     // Σ-part (binds a_c∈{A_i} and t to D) + the Bulletproofs hash conjunct.
     let blind = Scalar::from(Keypair::new(&secp256k1::Secp256k1::new()).sk);
@@ -138,11 +158,13 @@ fn poseidon_prove(st: &Statement, w: &Witness) -> Result<Proof> {
     Ok(Proof(out))
 }
 #[cfg(not(feature = "pi_a"))]
+#[allow(dead_code)] // gated off in `prove`/`verify`; kept for re-enablement
 fn poseidon_prove(_st: &Statement, _w: &Witness) -> Result<Proof> {
     Err(crate::Error::Protocol("pi_a::Scheme::Poseidon requires the `pi_a` Cargo feature"))
 }
 
 #[cfg(feature = "pi_a")]
+#[allow(dead_code)] // gated off in `prove`/`verify` pending the commitment-binding fix; kept for re-enablement
 fn poseidon_verify(st: &Statement, proof: &Proof) -> Result<bool> {
     let b = &proof.0;
     if b.len() < 4 {
@@ -161,6 +183,7 @@ fn poseidon_verify(st: &Statement, proof: &Proof) -> Result<bool> {
     Ok(true)
 }
 #[cfg(not(feature = "pi_a"))]
+#[allow(dead_code)] // gated off in `prove`/`verify`; kept for re-enablement
 fn poseidon_verify(_st: &Statement, _proof: &Proof) -> Result<bool> {
     Err(crate::Error::Protocol("pi_a::Scheme::Poseidon requires the `pi_a` Cargo feature"))
 }
@@ -294,6 +317,7 @@ mod squaring {
 // ===========================================================================
 
 #[cfg(feature = "pi_a")]
+#[allow(dead_code)] // reachable only via the (currently gated-off) Poseidon path; kept for re-enablement
 mod circuit {
     use ark_ff::{BigInteger, Field, One, PrimeField, Zero};
     use ark_secp256k1::{Affine, Fr}; // Affine = secp256k1 group; Fr = its scalar field F_n
@@ -678,9 +702,14 @@ mod tests {
         assert_eq!((ctxt + (-pad(Scheme::Squaring, &t))).unwrap(), a_c);
     }
 
+    /// Poseidon is gated off pending the commitment-binding fix (`docs/planning/
+    /// fable5-security-review.md` §1): `prove`/`verify` must fail closed under it so it can never gate
+    /// a live bet. (The dormant circuit code is still exercised directly in `mod circuit`'s tests.)
     #[cfg(feature = "pi_a")]
     #[test]
-    fn poseidon_scheme_roundtrip() {
-        roundtrip_and_soundness(Scheme::Poseidon);
+    fn poseidon_scheme_is_disabled() {
+        let (st, w) = honest(Scheme::Squaring, 0);
+        assert!(matches!(prove(Scheme::Poseidon, &st, &w), Err(crate::Error::Protocol(_))));
+        assert!(matches!(verify(Scheme::Poseidon, &st, &Proof(vec![])), Err(crate::Error::Protocol(_))));
     }
 }

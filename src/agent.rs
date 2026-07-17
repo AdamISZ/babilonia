@@ -119,7 +119,12 @@ impl Config {
             "pi_a_scheme" => {
                 self.pi_a_scheme = match value {
                     "squaring" => pi_a::Scheme::Squaring,
-                    "poseidon" => pi_a::Scheme::Poseidon,
+                    // Poseidon is disabled pending a soundness fix (unbound Σ/Bulletproofs
+                    // commitments — docs/planning/fable5-security-review.md §1). Refuse to select it,
+                    // so a dealer can never propose it.
+                    "poseidon" => {
+                        return Err("pi_a_scheme 'poseidon' is disabled pending a soundness fix; use 'squaring'".to_string())
+                    }
                     _ => return Err(bad()),
                 }
             }
@@ -300,6 +305,13 @@ impl ProposeTerms {
         } else {
             pi_a::Scheme::Squaring
         }
+    }
+    /// Whether we will play under the proposed π_a scheme. Poseidon (byte 1) is disabled pending a
+    /// soundness fix (unbound commitments — docs/planning/fable5-security-review.md §1), so a peer
+    /// proposing it is rejected *before* setup — the crypto layer would also fail closed, but this
+    /// gives a clean early rejection and never commits funds. Only Squaring (byte 0) is accepted.
+    fn scheme_supported(&self) -> bool {
+        self.scheme == 0
     }
     fn game_params(&self, network: Network) -> GameParams {
         let _ = network;
@@ -709,22 +721,31 @@ fn peer_worker(
         match transport.try_recv() {
             Ok(Some(frame)) => {
                 if let Some(terms) = ProposeTerms::decode(&frame) {
-                    match accept.decide(terms.stake_sats, &config) {
-                        AcceptDecision::Accept => {
-                            let _ = to_core.send(Input::Worker(WorkerEvent::Info(format!(
-                                "accepting bet of {} sats",
-                                terms.stake_sats
-                            ))));
-                            if transport.send(MSG_ACCEPT).is_ok() {
-                                run_player(&mut *transport, &backend, &config, terms, &to_core);
+                    if !terms.scheme_supported() {
+                        // A dealer unilaterally picks the π_a scheme; refuse a disabled one up front
+                        // (the crypto layer also fails closed, but this rejects before any funds move).
+                        let _ = to_core.send(Input::Worker(WorkerEvent::Info(
+                            "rejecting proposal: unsupported/disabled π_a scheme (only 'squaring')".into(),
+                        )));
+                        let _ = transport.send(MSG_REJECT);
+                    } else {
+                        match accept.decide(terms.stake_sats, &config) {
+                            AcceptDecision::Accept => {
+                                let _ = to_core.send(Input::Worker(WorkerEvent::Info(format!(
+                                    "accepting bet of {} sats",
+                                    terms.stake_sats
+                                ))));
+                                if transport.send(MSG_ACCEPT).is_ok() {
+                                    run_player(&mut *transport, &backend, &config, terms, &to_core);
+                                }
                             }
-                        }
-                        AcceptDecision::Reject => {
-                            let _ = transport.send(MSG_REJECT);
-                        }
-                        AcceptDecision::Ask => {
-                            let _ = to_core.send(Input::Worker(WorkerEvent::Proposed { stake_sats: terms.stake_sats }));
-                            pending_terms = Some(terms);
+                            AcceptDecision::Reject => {
+                                let _ = transport.send(MSG_REJECT);
+                            }
+                            AcceptDecision::Ask => {
+                                let _ = to_core.send(Input::Worker(WorkerEvent::Proposed { stake_sats: terms.stake_sats }));
+                                pending_terms = Some(terms);
+                            }
                         }
                     }
                 }
@@ -865,15 +886,17 @@ mod tests {
         c.apply("stake_percent", "7").unwrap();
         c.apply("auto_accept", "true").unwrap();
         c.apply("auto_accept_cap_sats", "999").unwrap();
-        c.apply("pi_a_scheme", "poseidon").unwrap();
+        c.apply("pi_a_scheme", "squaring").unwrap();
         c.save(&path).unwrap();
 
         let loaded = Config::load(&path);
         assert_eq!(loaded.stake_percent, 7);
         assert!(loaded.auto_accept);
         assert_eq!(loaded.auto_accept_cap_sats, 999);
-        assert_eq!(loaded.pi_a_scheme, pi_a::Scheme::Poseidon);
+        assert_eq!(loaded.pi_a_scheme, pi_a::Scheme::Squaring);
 
+        // Poseidon is disabled pending a soundness fix — it cannot be selected.
+        assert!(c.apply("pi_a_scheme", "poseidon").is_err());
         assert!(c.apply("nope", "x").is_err());
         assert!(c.apply("stake_percent", "notnum").is_err());
         let _ = std::fs::remove_dir_all(&dir);
