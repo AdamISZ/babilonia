@@ -237,9 +237,10 @@ fn setup_handshake_over_bip324() {
     };
 
     // Bob runs on another thread; both sides talk only through their Bip324Transport.
+    let (bob_fund_pk, alice_id_pk) = (bob.funding.pk, alice.identity.pk);
     let params_b = params.clone();
-    let bob_handle = std::thread::spawn(move || run_bob(&mut tb, &params_b, &bob));
-    let a = run_alice(&mut ta, &params, &alice).expect("alice setup over decoys");
+    let bob_handle = std::thread::spawn(move || run_bob(&mut tb, &params_b, &bob, &alice_id_pk));
+    let a = run_alice(&mut ta, &params, &alice, &bob_fund_pk).expect("alice setup over decoys");
     let b = bob_handle.join().unwrap().expect("bob setup over decoys");
 
     // Both sides reached the same shared view — the whole 4-flight exchange survived the covert

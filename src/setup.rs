@@ -175,8 +175,16 @@ fn shared_secret(sk: &secp256k1::SecretKey, other_pk: &secp256k1::PublicKey) -> 
 }
 
 /// Run Alice's side (signer index 0).
-pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets) -> Result<SetupResult> {
+pub fn run_alice<T: Transport>(
+    ch: &mut T,
+    params: &GameParams,
+    s: &AliceSecrets,
+    bob_key: &secp256k1::PublicKey,
+) -> Result<SetupResult> {
     let p_a: Point = s.identity.pk.into();
+    // Bob's funding key is fixed by the funding phase (`FundReply.p_b`) and threaded in here — it is
+    // NOT re-exchanged in setup, so the pot key can't diverge from what the tx graph is signed against.
+    let p_b: Point = (*bob_key).into();
     let thimbles = s.thimbles.map(|a| a.base_point_mul());
     let [a1, a2] = thimbles;
 
@@ -190,7 +198,6 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
     // Flight 1 (P2): thimbles + PoKs.
     ch.send(
         &AliceOpen {
-            p_a,
             a1,
             a2,
             thimble_poks: sigma::prove_thimble_poks(&s.thimbles, &p_a.serialize()),
@@ -198,15 +205,14 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
         .encode(),
     )?;
 
-    // Flight 2 (P3): Bob's key, K, π_r, nonces.
+    // Flight 2 (P3): K, π_r, nonces (Bob's funding key is not in this frame — see `p_b` above).
     let commit = BobCommit::decode(&ch.recv()?)?;
-    let ctx = ctx_keys(&p_a, &commit.p_b);
+    let ctx = ctx_keys(&p_a, &p_b);
     if !sigma::verify_pi_r(&commit.k, &thimbles, &ctx, &commit.pi_r) {
         return Err(Error::ProofInvalid("pi_r"));
     }
-    let p_b_pub: secp256k1::PublicKey = commit.p_b.into();
-    let u1 = TaprootKey::new(s.identity.pk, p_b_pub)?;
-    let shared = shared_secret(&s.identity.sk, &p_b_pub);
+    let u1 = TaprootKey::new(s.identity.pk, *bob_key)?;
+    let shared = shared_secret(&s.identity.sk, bob_key);
     let (settle_tx, settle_sighash, _claim, refund_tx, refund_sighash) =
         tx_graph(&u1, &s.identity.pk, &commit.k, params, &shared)?;
 
@@ -263,32 +269,40 @@ pub fn run_alice<T: Transport>(ch: &mut T, params: &GameParams, s: &AliceSecrets
 }
 
 /// Run Bob's side (signer index 1).
-pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) -> Result<SetupResult> {
+pub fn run_bob<T: Transport>(
+    ch: &mut T,
+    params: &GameParams,
+    s: &BobSecrets,
+    alice_key: &secp256k1::PublicKey,
+) -> Result<SetupResult> {
     if s.guess >= 2 {
         return Err(Error::Protocol("guess out of range"));
     }
+    // Alice's funding key is fixed by the funding phase (`FundOpen.p_a`) and threaded in here — it is
+    // NOT re-exchanged in `AliceOpen`, so the pot key can't diverge from what the tx graph is signed
+    // against. Used for the PoK domain, the ctx, `U1`, and the ECDH shuffle seed.
+    let p_a: Point = (*alice_key).into();
     // Flight 1 (P2): Alice's thimbles + PoKs.
     let open = AliceOpen::decode(&ch.recv()?)?;
     if open.a1 == open.a2 {
         return Err(Error::Protocol("degenerate thimbles: A_1 == A_2"));
     }
     let thimbles = [open.a1, open.a2];
-    if !sigma::verify_thimble_poks(&thimbles, &open.p_a.serialize(), &open.thimble_poks) {
+    if !sigma::verify_thimble_poks(&thimbles, &p_a.serialize(), &open.thimble_poks) {
         return Err(Error::ProofInvalid("thimble PoKs"));
     }
 
     let p_b: Point = s.funding.pk.into();
     let w_b: Point = s.claim.pk.into();
     let k = compute_k(&w_b, &thimbles[s.guess])?; // K = W_b + A_y
-    let ctx = ctx_keys(&open.p_a, &p_b);
+    let ctx = ctx_keys(&p_a, &p_b);
     let w_b_scalar: Scalar = s.claim.sk.into();
     let pi_r = sigma::prove_pi_r(&w_b_scalar, s.guess, &k, &thimbles, &ctx)?;
 
-    let p_a_pub: secp256k1::PublicKey = open.p_a.into();
-    let u1 = TaprootKey::new(p_a_pub, s.funding.pk)?;
-    let shared = shared_secret(&s.funding.sk, &p_a_pub);
+    let u1 = TaprootKey::new(*alice_key, s.funding.pk)?;
+    let shared = shared_secret(&s.funding.sk, alice_key);
     let (settle_tx, settle_sighash, _claim, refund_tx, refund_sighash) =
-        tx_graph(&u1, &p_a_pub, &k, params, &shared)?;
+        tx_graph(&u1, alice_key, &k, params, &shared)?;
 
     // Bob's sessions + nonces.
     let (r1_refund, refund_nonce) = u1.keyagg.first_round(1, s.funding.sk, fresh_seed())?;
@@ -298,7 +312,7 @@ pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) ->
     let (_r1_coop, coop_nonce) = u1.keyagg.first_round(1, s.funding.sk, coop_seed)?;
 
     // Flight 2 (P3).
-    ch.send(&BobCommit { p_b, k, pi_r, refund_nonce, settle_nonce, coop_nonce }.encode())?;
+    ch.send(&BobCommit { k, pi_r, refund_nonce, settle_nonce, coop_nonce }.encode())?;
 
     // Flight 3 (P4): Alice's nonces, ctxt, D, π_a, partials.
     let reveal = AliceReveal::decode(&ch.recv()?)?;
@@ -335,7 +349,7 @@ pub fn run_bob<T: Transport>(ch: &mut T, params: &GameParams, s: &BobSecrets) ->
         d_point: reveal.d_point,
         k,
         thimbles,
-        p_a: open.p_a,
+        p_a,
         coop_seed,
         coop_peer_nonce: reveal.coop_nonce,
     })
@@ -400,10 +414,11 @@ mod tests {
         let a_c = alice.thimbles[c];
         let w_b = Scalar::from(bob.claim.sk);
 
+        let (bob_fund_pk, alice_id_pk) = (bob.funding.pk, alice.identity.pk);
         let (mut alice_ch, mut bob_ch) = channel_pair();
         let params_b = params.clone();
-        let bob_handle = std::thread::spawn(move || run_bob(&mut bob_ch, &params_b, &bob));
-        let a = run_alice(&mut alice_ch, &params, &alice).unwrap();
+        let bob_handle = std::thread::spawn(move || run_bob(&mut bob_ch, &params_b, &bob, &alice_id_pk));
+        let a = run_alice(&mut alice_ch, &params, &alice, &bob_fund_pk).unwrap();
         let b = bob_handle.join().unwrap().unwrap();
 
         // Both sides agree on the shared artifacts.

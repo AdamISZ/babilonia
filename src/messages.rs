@@ -2,11 +2,14 @@
 //! a compact self-describing codec. These are the frames over a [`crate::transport::Transport`].
 //! Only public data — group points/scalars, MuSig2 nonces/partials, and opaque proof bytes.
 //!
-//! Four flights (game parameters are agreed out-of-band as [`crate::setup::GameParams`]). Nonces
+//! Four flights (game parameters are agreed out-of-band as [`crate::setup::GameParams`]). The funding
+//! keys `P_a`, `P_b` are **not** re-exchanged here: they were fixed in the funding sub-protocol
+//! (`FundOpen`/`FundReply`) and are threaded into the driver, so the pot key is a single source of
+//! truth and the tx graph can't be pre-signed against a different `U1` than the one funded. Nonces
 //! follow key exchange, since a MuSig2 session needs both keys to form the aggregate:
 //! ```text
-//! 1. AliceOpen   A→B : P_a, thimbles A_1,A_2 (+ PoKs)                                        (P2)
-//! 2. BobCommit   B→A : P_b, K=W_b+A_y (+ π_r), refund & settlement nonces                    (P3)
+//! 1. AliceOpen   A→B : thimbles A_1,A_2 (+ PoKs)                                             (P2)
+//! 2. BobCommit   B→A : K=W_b+A_y (+ π_r), refund & settlement nonces                         (P3)
 //! 3. AliceReveal A→B : refund & settlement nonces, ctxt=a_c+H(d), D=d·G, π_a (Σ-part),
 //!                      refund & settlement partials                                          (P4)
 //! 4. BobAuth     B→A : refund & settlement partials (authorises the D-adaptor pre-sig)       (P5)
@@ -92,22 +95,20 @@ pub struct CoopReveal {
     pub alice_partial: PartialSignature,
 }
 
-/// Flight 1 (P2) — Alice → Bob. Her funding key `P_a` and thimbles `A_1,A_2 = a_1·G, a_2·G` with
-/// PoKs.
+/// Flight 1 (P2) — Alice → Bob. Her thimbles `A_1,A_2 = a_1·G, a_2·G` with PoKs. Her funding key
+/// `P_a` is **not** re-sent — it is the one from the funding phase, threaded into the setup driver.
 #[derive(Clone, Debug)]
 pub struct AliceOpen {
-    pub p_a: Point,
     pub a1: Point,
     pub a2: Point,
     pub thimble_poks: Vec<u8>,
 }
 
-/// Flight 2 (P3) — Bob → Alice. His funding key `P_b` (so Alice can form `Q`), claim key
-/// `K = W_b + A_y` (`W_b` = Bob's fresh *hidden* claim key, `≠ P_b`) with `π_r`, and his public
-/// nonces for the refund and settlement MuSig2 sessions.
+/// Flight 2 (P3) — Bob → Alice. His claim key `K = W_b + A_y` (`W_b` = Bob's fresh *hidden* claim
+/// key, `≠ P_b`) with `π_r`, and his public nonces for the refund and settlement MuSig2 sessions. His
+/// funding key `P_b` is **not** re-sent — the funding-phase key is threaded into the setup driver.
 #[derive(Clone, Debug)]
 pub struct BobCommit {
-    pub p_b: Point,
     pub k: Point,
     pub pi_r: Vec<u8>,
     pub refund_nonce: PubNonce,
@@ -232,7 +233,7 @@ impl<'a> Reader<'a> {
 impl AliceOpen {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![TAG_ALICE_OPEN];
-        for p in [&self.p_a, &self.a1, &self.a2] {
+        for p in [&self.a1, &self.a2] {
             put_point(&mut out, p);
         }
         put_lp(&mut out, &self.thimble_poks);
@@ -242,7 +243,6 @@ impl AliceOpen {
         let mut r = Reader::new(buf);
         r.tag(TAG_ALICE_OPEN)?;
         let m = AliceOpen {
-            p_a: r.point()?,
             a1: r.point()?,
             a2: r.point()?,
             thimble_poks: r.lp()?,
@@ -255,7 +255,6 @@ impl AliceOpen {
 impl BobCommit {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![TAG_BOB_COMMIT];
-        put_point(&mut out, &self.p_b);
         put_point(&mut out, &self.k);
         put_lp(&mut out, &self.pi_r);
         put_nonce(&mut out, &self.refund_nonce);
@@ -267,7 +266,6 @@ impl BobCommit {
         let mut r = Reader::new(buf);
         r.tag(TAG_BOB_COMMIT)?;
         let m = BobCommit {
-            p_b: r.point()?,
             k: r.point()?,
             pi_r: r.lp()?,
             refund_nonce: r.nonce()?,
@@ -443,12 +441,11 @@ mod tests {
 
     #[test]
     fn flights_round_trip() {
-        let open = AliceOpen { p_a: some_point(), a1: some_point(), a2: some_point(), thimble_poks: vec![1, 2, 3] };
+        let open = AliceOpen { a1: some_point(), a2: some_point(), thimble_poks: vec![1, 2, 3] };
         assert_eq!(AliceOpen::decode(&open.encode()).unwrap().thimble_poks, open.thimble_poks);
         assert_eq!(AliceOpen::decode(&open.encode()).unwrap().a1, open.a1);
 
         let commit = BobCommit {
-            p_b: some_point(),
             k: some_point(),
             pi_r: vec![9],
             refund_nonce: some_nonce(),
@@ -505,7 +502,7 @@ mod tests {
         assert_eq!(dec.coop_tx, tx);
         assert_eq!(dec.alice_partial, reveal.alice_partial);
         // Wrong tag is rejected.
-        assert!(CoopReveal::decode(&AliceOpen { p_a: some_point(), a1: some_point(), a2: some_point(), thimble_poks: vec![] }.encode()).is_err());
+        assert!(CoopReveal::decode(&AliceOpen { a1: some_point(), a2: some_point(), thimble_poks: vec![] }.encode()).is_err());
     }
 
     #[test]

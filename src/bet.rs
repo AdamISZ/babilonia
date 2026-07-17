@@ -58,6 +58,11 @@ pub struct Bet<T: Transport> {
     /// `broadcast_funding` (after the refund is pre-signed), so no broadcastable funding exists early.
     funding_psbt: Option<String>,
     funding_tx: Option<Transaction>,
+    /// The peer's funding key, learned in `fund_pot` (`FundOpen`/`FundReply`) and threaded into
+    /// `setup` so the pot key is a single source of truth — the setup driver never re-exchanges it,
+    /// so a malicious peer can't pre-sign the tx graph against a different key than the funded `U1`.
+    /// In-memory only (setup runs live; recovery uses the persisted artifacts).
+    peer_key: Option<secp256k1::PublicKey>,
     /// Dealer only: the pre-signed 2-out CSV-leaf reclaim of `O_K`, built at setup and persisted.
     reclaim_tx: Option<Transaction>,
     progress: Option<Box<dyn Fn(&str) + Send>>,
@@ -113,6 +118,7 @@ impl<T: Transport> Bet<T> {
             recovered_a_c: None,
             funding_psbt: None,
             funding_tx: None,
+            peer_key: None,
             reclaim_tx: None,
             progress: None,
             bet_id: new_id(),
@@ -658,6 +664,7 @@ impl<T: Transport> BetChain for Bet<T> {
                 )?;
                 let reply = FundReply::decode(&self.transport.recv()?)?;
                 let p_b: secp256k1::PublicKey = reply.p_b.into();
+                self.peer_key = Some(p_b); // single source of truth for the pot key; reused in `setup`
                 let (u1, _u1_addr) = self.u1_taproot(&my_key, &p_b)?;
                 let (u1_value, c_b) = Self::funding_amounts(f_a, Amount::from_sat(reply.amount), b, fee)?;
                 Self::check_park(u1_value, a, b, fee)?;
@@ -669,6 +676,7 @@ impl<T: Transport> BetChain for Bet<T> {
             Side::Player => {
                 let open = FundOpen::decode(&self.transport.recv()?)?;
                 let p_a: secp256k1::PublicKey = open.p_a.into();
+                self.peer_key = Some(p_a); // single source of truth for the pot key; reused in `setup`
                 let (u1, u1_addr) = self.u1_taproot(&p_a, &my_key)?;
                 let (input, f_b) = self.wallet.select_input(b + fee)?; // F_B ≥ b + fee ⇒ non-dust change
                 let change = self.wallet.change_address()?.to_string();
@@ -746,9 +754,12 @@ impl<T: Transport> BetChain for Bet<T> {
 
     fn setup(&mut self) -> Result<()> {
         self.log("running the 4-flight setup (thimbles, K+π_r, ctxt/D/π_a, dual pre-sign)…");
+        let peer_key = self
+            .peer_key
+            .ok_or(Error::Protocol("peer funding key missing — fund_pot must run before setup"))?;
         let result = match &self.role {
-            BetRole::Dealer(s) => run_alice(&mut self.transport, &self.params, s)?,
-            BetRole::Player(s) => run_bob(&mut self.transport, &self.params, s)?,
+            BetRole::Dealer(s) => run_alice(&mut self.transport, &self.params, s, &peer_key)?,
+            BetRole::Player(s) => run_bob(&mut self.transport, &self.params, s, &peer_key)?,
         };
         self.setup = Some(result);
         // Dealer: pre-build the enforced Alice-win reclaim now (valid only after t_1), so it's on disk

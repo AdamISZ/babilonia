@@ -106,12 +106,18 @@ proofs (thimble PoKs, `π_r`, `π_a`) are exchanged.
 
 | # | Message | Tag | Direction | Contents | Purpose |
 |---|---------|-----|-----------|----------|---------|
-| 6 | `AliceOpen` | `0x01` | Alice → Bob | `p_a: Point`, `a1: Point`, `a2: Point`, `thimble_poks: var-bytes` | Alice's funding key and thimbles `A_1, A_2 = a_1·G, a_2·G` with proofs of knowledge |
-| 7 | `BobCommit` | `0x02` | Bob → Alice | `p_b: Point`, `k: Point`, `pi_r: var-bytes`, `refund_nonce: PubNonce`, `settle_nonce: PubNonce`, `coop_nonce: PubNonce` | Bob's funding key, his claim key `K = W_b + A_y` with proof `π_r`, and his nonces for the refund, settlement, **and cooperative-overlay** MuSig2 sessions |
+| 6 | `AliceOpen` | `0x01` | Alice → Bob | `a1: Point`, `a2: Point`, `thimble_poks: var-bytes` | Alice's thimbles `A_1, A_2 = a_1·G, a_2·G` with proofs of knowledge. Her funding key `P_a` is **not** re-sent — the Phase-1 key is threaded into the driver |
+| 7 | `BobCommit` | `0x02` | Bob → Alice | `k: Point`, `pi_r: var-bytes`, `refund_nonce: PubNonce`, `settle_nonce: PubNonce`, `coop_nonce: PubNonce` | His claim key `K = W_b + A_y` with proof `π_r`, and his nonces for the refund, settlement, **and cooperative-overlay** MuSig2 sessions. His funding key `P_b` is **not** re-sent — the Phase-1 key is threaded into the driver |
 | 8 | `AliceReveal` | `0x03` | Alice → Bob | `refund_nonce: PubNonce`, `settle_nonce: PubNonce`, `ctxt: Scalar`, `d_point: Point` (= `D`), `pi_a: var-bytes`, `refund_partial: PartialSignature`, `settle_partial: PartialSignature`, `coop_nonce: PubNonce` | Alice's nonces (refund, settlement, **overlay**), the encrypted outcome `ctxt`, the adaptor point `D`, proof `π_a`, and her partials for the refund and the `D`-locked settlement |
 | 9 | `BobAuth` | `0x04` | Bob → Alice | `refund_partial: PartialSignature`, `settle_partial: PartialSignature` | Bob's partials, completing both MuSig2 sessions (authorises the settlement adaptor pre-signature) |
 
 After Phase 2 both parties hold the identical pre-signed refund and settlement-adaptor.
+
+> **Funding keys are not re-exchanged.** `AliceOpen`/`BobCommit` deliberately omit `P_a`/`P_b`: the pot
+> key is fixed once, in Phase 1 (`FundOpen`/`FundReply`), and threaded into the setup driver. This is a
+> single source of truth — it makes it structurally impossible for the tx graph (refund + settlement)
+> to be pre-signed against a different `U1` key than the one actually funded, which would otherwise let
+> a peer sending mismatched keys strand the pot with no valid exit.
 
 ---
 
